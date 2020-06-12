@@ -50,7 +50,6 @@ class SquadExample:
                  title: str,
                  answers: Optional[List[str]] = None,
                  is_impossible: bool = False,
-                 is_plausible: bool = False,
                  ):
         """
 
@@ -75,8 +74,6 @@ class SquadExample:
             Holds answers as well as their start positions.
         is_impossible
             False by default, set to True if the example has no possible answer.
-        is_plausible
-            False by default, set to True if the answer of this example is plausible.
         """
         self.qas_id = qas_id
         self.query_text = query_text
@@ -84,7 +81,6 @@ class SquadExample:
         self.answer_text = answer_text
         self.title = title
         self.is_impossible = is_impossible
-        self.is_plausible = is_plausible
         self.answers = answers
         self.start_position = start_position
         self.end_position = end_position
@@ -100,8 +96,8 @@ class SquadExample:
 
 DocChunk = namedtuple('DocChunk', ['start', 'length',
                                    'is_impossible',
-                                   'gt_start_pos',
-                                   'gt_end_pos'])
+                                   'start_pos',
+                                   'end_pos'])
 
 
 class SquadFeature:
@@ -113,9 +109,9 @@ class SquadFeature:
                  is_impossible,
                  token_answer_mismatch,
                  unreliable_span,
-                 gt_answer_text,
-                 gt_start_pos,
-                 gt_end_pos):
+                 answer_text,
+                 start_pos,
+                 end_pos):
         """The Squad Feature
 
         Parameters
@@ -144,16 +140,16 @@ class SquadFeature:
                      "emotion"                   "emotional"
 
         unreliable_span
-            If this value is True, it means that we cannot rely on the gt_start_pos and gt_end_pos.
+            If this value is True, it means that we cannot rely on the start_pos and end_pos.
             In this scenario, we cannot utilize the span-prediction-based approach.
             One example is the question about "how many", the answer will spread across the
             whole document and there is no clear span.
-        gt_answer_text
+        answer_text
             The ground-truth answer text
-        gt_start_pos
+        start_pos
             The start position of the ground-truth span. None indicates that there is no valid
             ground-truth span.
-        gt_end_pos
+        end_pos
             The end position of the ground-truth span. None indicates that there is no valid
             ground-truth span.
         """
@@ -165,9 +161,9 @@ class SquadFeature:
         self.is_impossible = is_impossible
         self.token_answer_mismatch = token_answer_mismatch
         self.unreliable_span = unreliable_span
-        self.gt_answer_text = gt_answer_text
-        self.gt_start_pos = gt_start_pos
-        self.gt_end_pos = gt_end_pos
+        self.answer_text = answer_text
+        self.start_pos = start_pos
+        self.end_pos = end_pos
 
     def to_json(self):
         return json.dumps(self.__dict__)
@@ -218,26 +214,26 @@ class SquadFeature:
         ret = []
         while doc_ptr < len(self.context_token_ids):
             chunk_length = min(max_chunk_length, len(self.context_token_ids) - doc_ptr)
-            if self.gt_answer_text is None:
-                chunk_gt_start_pos = None
-                chunk_gt_end_pos = None
+            if self.answer_text is None:
+                chunk_start_pos = None
+                chunk_end_pos = None
                 chunk_is_impossible = True
             else:
-                if self.gt_start_pos is not None and self.gt_end_pos is not None and\
-                        self.gt_start_pos >= doc_ptr and self.gt_end_pos < doc_ptr + chunk_length:
+                if self.start_pos is not None and self.end_pos is not None and\
+                        self.start_pos >= doc_ptr and self.end_pos < doc_ptr + chunk_length:
                     # The chunk contains the ground-truth annotation
-                    chunk_gt_start_pos = self.gt_start_pos - doc_ptr
-                    chunk_gt_end_pos = self.gt_end_pos - doc_ptr
+                    chunk_start_pos = self.start_pos - doc_ptr
+                    chunk_end_pos = self.end_pos - doc_ptr
                     chunk_is_impossible = False
                 else:
-                    chunk_gt_start_pos = None
-                    chunk_gt_end_pos = None
+                    chunk_start_pos = None
+                    chunk_end_pos = None
                     chunk_is_impossible = True
             ret.append(DocChunk(start=doc_ptr,
                                 length=chunk_length,
                                 is_impossible=chunk_is_impossible,
-                                gt_start_pos=chunk_gt_start_pos,
-                                gt_end_pos=chunk_gt_end_pos))
+                                start_pos=chunk_start_pos,
+                                end_pos=chunk_end_pos))
             if doc_ptr + chunk_length == len(self.context_token_ids):
                 break
             doc_ptr += doc_stride
@@ -291,13 +287,20 @@ def get_squad_examples_from_json(json_file: str, is_training: bool) -> List[Squa
                 else:
                     is_impossible = False
 
-                if not is_impossible:
-                    if is_training:
+                if is_training:
+                    if not is_impossible:
                         answers = qa["answers"][0]
                         answer_text, start_position, end_position = \
                             get_answers_from_qa(answers, context_text, qas_id)
                     else:
-                        answers = qa["answers"]
+                        # For the case of impossible question, the SQuAD2.0 offers plausible_answers
+                        # with proper grammatical structure that fit the question to fool the model
+                        answers = qa["plausible_answers"][0]
+                        answer_text, start_position, end_position = \
+                            get_answers_from_qa(answers, context_text, qas_id)
+
+                else:
+                    answers = qa["answers"]
 
                 example = SquadExample(
                     qas_id=qas_id,
@@ -309,7 +312,6 @@ def get_squad_examples_from_json(json_file: str, is_training: bool) -> List[Squa
                     answers=answers,
                     title=title,
                     is_impossible=is_impossible,
-                    is_plausible=False,
                 )
                 examples.append(example)
     return examples
@@ -380,11 +382,10 @@ def convert_squad_example_to_feature(example: SquadExample,
     query_text = example.query_text
     context_token_ids, offsets = tokenizer.encode_with_offsets(context_text, int)
     query_token_ids = tokenizer.encode(query_text, int)
-    gt_answer_text = answer_text
-    gt_span_start_pos, gt_span_end_pos = None, None
+    span_start_pos, span_end_pos = None, None
     token_answer_mismatch = False
     unreliable_span = False
-    if is_training and not example.is_impossible:
+    if is_training and answer_text:
         assert example.start_position >= 0 and example.end_position >= 0
         # From the offsets, we locate the first offset that contains start_pos and the last offset
         # that contains end_pos, i.e.
@@ -442,8 +443,8 @@ def convert_squad_example_to_feature(example: SquadExample,
             else:
                 break
 
-        gt_span_start_pos = lower_idx
-        gt_span_end_pos = upper_idx
+        span_start_pos = lower_idx
+        span_end_pos = upper_idx
 
     feature = SquadFeature(qas_id=example.qas_id,
                            query_token_ids=query_token_ids,
@@ -453,9 +454,9 @@ def convert_squad_example_to_feature(example: SquadExample,
                            is_impossible=example.is_impossible,
                            token_answer_mismatch=token_answer_mismatch,
                            unreliable_span=unreliable_span,
-                           gt_answer_text=gt_answer_text,
-                           gt_start_pos=gt_span_start_pos,
-                           gt_end_pos=gt_span_end_pos)
+                           answer_text=answer_text,
+                           start_pos=span_start_pos,
+                           end_pos=span_end_pos)
     return feature
 
 
