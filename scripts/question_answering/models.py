@@ -353,7 +353,7 @@ class ModelForQAConditionalV1(HybridBlock):
         end_top_logits, end_top_index = mx.npx.topk(end_logits, k=end_top_n, axis=-1,
                                                     ret_typ='both')
         answerable_logits = self.get_answerable_logits(mx.nd, contextual_embeddings, p_mask)
-        plausible_logits = self.get_answerable_logits(mx.nd, contextual_embeddings, p_mask, a_mask)
+        plausible_logits = self.get_plausible_logits(mx.nd, contextual_embeddings, p_mask, a_mask)
         pos_cls_logits = self.pos_cls_verification(
             mx.nd, start_logits, contextual_embeddings, p_mask)
         return start_top_logits, start_top_index, end_top_logits, end_top_index, \

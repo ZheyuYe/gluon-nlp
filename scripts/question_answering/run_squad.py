@@ -670,6 +670,7 @@ RawResultExtended = collections.namedtuple(
      'end_top_logits',
      'end_top_index',
      'answerable_logits',
+     'plausible_logits',
      'pos_cls_logits'])
 
 
@@ -867,10 +868,11 @@ def evaluate(args, last=True):
                 segment_ids = sample.segment_ids.as_in_ctx(ctx)
                 valid_length = sample.valid_length.as_in_ctx(ctx)
                 p_mask = sample.masks.as_in_ctx(ctx)
+                a_mask = sample.answer_masks.as_in_ctx(ctx)
                 p_mask = 1 - p_mask  # In the network, we use 1 --> no_mask, 0 --> mask
                 start_top_logits, start_top_index, end_top_logits, end_top_index, answerable_logits, \
                     plausible_logits, pos_cls_logits = qa_net.inference(tokens,
-                    segment_ids, valid_length, p_mask, args.start_top_n, args.end_top_n)
+                    segment_ids, valid_length, p_mask, a_mask, args.start_top_n, args.end_top_n)
                 for i, qas_id in enumerate(sample.qas_id):
                     result = RawResultExtended(qas_id=qas_id,
                                                start_top_logits=start_top_logits[i].asnumpy(),
@@ -879,7 +881,7 @@ def evaluate(args, last=True):
                                                end_top_index=end_top_index[i].asnumpy(),
                                                answerable_logits=answerable_logits[i].asnumpy(),
                                                plausible_logits=plausible_logits[i].asnumpy(),
-                                               pos_cls_logits=pos_cls_logits[i].asnumpy()),
+                                               pos_cls_logits=pos_cls_logits[i].asnumpy())
 
                     all_results.append(result)
 
