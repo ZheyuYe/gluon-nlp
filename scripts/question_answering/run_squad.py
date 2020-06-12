@@ -229,16 +229,20 @@ class SquadDatasetProcessor:
             masks = np.array([0] + [1] * len(truncated_query_ids) + [1] + [0] * chunk.length + [1],
                              dtype=np.int32)
             context_offset = len(truncated_query_ids) + 2
-            is_impossible = feature.is_impossible or chunk.is_impossible
             answer_masks = masks.copy()
-            if feature.is_impossible or chunk.is_impossible:
-                start_pos = 0
-                end_pos = 0
-            else:
+            if chunk.start_pos is not None and chunk.end_pos is not None:
                 # Here, we increase the start and end because we put query before context
                 start_pos = chunk.start_pos + context_offset
                 end_pos = chunk.end_pos + context_offset
-                answer_masks[start_pos:end_pos] = 1
+                answer_masks[start_pos:end_pos+1] = 1
+            else:
+                start_pos = 0
+                end_pos = 0
+
+            is_impossible = feature.is_impossible or chunk.is_impossible
+            if is_impossible:
+                start_pos = 0
+                end_pos = 0
 
             chunk_feature = self.ChunkFeature(qas_id=feature.qas_id,
                                               data=data,
