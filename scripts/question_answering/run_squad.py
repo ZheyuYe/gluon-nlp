@@ -17,7 +17,7 @@ import numpy as np
 from mxnet.lr_scheduler import PolyScheduler
 
 import gluonnlp.data.batchify as bf
-from models import ModelForQABasic, ModelForQAConditionalV1
+from models import ModelForQAConditionalV1
 from eval_utils import squad_eval
 from squad_utils import SquadFeature, get_squad_examples, convert_squad_example_to_feature
 from gluonnlp.models import get_backbone
@@ -577,7 +577,8 @@ def train(args):
                     sel_answerable_logits = answerable_logits[batch_idx, is_impossible]
                     sel_plausible_logits = plausible_logits[batch_idx, is_impossible]
                     span_loss = - 0.5 * (sel_start_logits + sel_end_logits).sum()
-                    answerable_loss = - 0.5 * 0.5 * (sel_answerable_logits + sel_plausible_logits).sum()
+                    answerable_loss = - 0.5 * 0.5 * \
+                        (sel_answerable_logits + sel_plausible_logits).sum()
                     loss = (span_loss + answerable_loss) / loss_denom
                     loss_l.append(loss)
                     span_loss_l.append(span_loss)
@@ -733,7 +734,10 @@ def predict_extended(original_feature,
     for chunk_id, (result, chunk_feature) in enumerate(zip(results, chunked_features)):
         # We use the log-likelihood as the not answerable score.
         # Thus, a high score indicates that the answer is not answerable
-        cur_not_answerable_score = float(result.answerable_logits[1])
+        cur_not_answerable_score = float(
+            result.answerable_logits[1] +
+            result.answerable_logits[1] +
+            result.pos_cls_logits)
         not_answerable_score = min(not_answerable_score, cur_not_answerable_score)
         # Calculate the start_logits + end_logits as the overall score
         context_offset = chunk_feature.context_offset
@@ -865,8 +869,8 @@ def evaluate(args, last=True):
                 p_mask = sample.masks.as_in_ctx(ctx)
                 p_mask = 1 - p_mask  # In the network, we use 1 --> no_mask, 0 --> mask
                 start_top_logits, start_top_index, end_top_logits, end_top_index, answerable_logits, \
-                    pos_cls_logits = qa_net.inference(tokens, segment_ids, valid_length, p_mask,
-                                                      args.start_top_n, args.end_top_n)
+                    plausible_logits, pos_cls_logits = qa_net.inference(tokens,
+                    segment_ids, valid_length, p_mask, args.start_top_n, args.end_top_n)
                 for i, qas_id in enumerate(sample.qas_id):
                     result = RawResultExtended(qas_id=qas_id,
                                                start_top_logits=start_top_logits[i].asnumpy(),
@@ -874,7 +878,8 @@ def evaluate(args, last=True):
                                                end_top_logits=end_top_logits[i].asnumpy(),
                                                end_top_index=end_top_index[i].asnumpy(),
                                                answerable_logits=answerable_logits[i].asnumpy(),
-                                               pos_cls_logits=pos_cls_logits[i].asnumpy())
+                                               plausible_logits=plausible_logits[i].asnumpy(),
+                                               pos_cls_logits=pos_cls_logits[i].asnumpy()),
 
                     all_results.append(result)
 

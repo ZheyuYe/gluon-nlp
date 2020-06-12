@@ -14,6 +14,7 @@ class ModelForQABasic(HybridBlock):
     another dense layer to map the contextual embeddings to the start scores and end scores.
 
     """
+
     def __init__(self, backbone, weight_initializer=None, bias_initializer=None,
                  prefix=None, params=None):
         super().__init__(prefix=prefix, params=params)
@@ -76,6 +77,7 @@ class ModelForQAConditionalV1(HybridBlock):
     In the inference phase, we are able to use beam search to do the inference.
 
     """
+
     def __init__(self, backbone, units=768, layer_norm_eps=1E-12, dropout_prob=0.1,
                  activation='tanh', weight_initializer=None, bias_initializer=None,
                  prefix=None, params=None):
@@ -126,15 +128,15 @@ class ModelForQAConditionalV1(HybridBlock):
             self.plausible_scores = nn.HybridSequential(prefix='plausible_scores_')
             with self.plausible_scores.name_scope():
                 self.plausible_scores.add(nn.Dense(units, flatten=False,
-                                                    weight_initializer=weight_initializer,
-                                                    bias_initializer=bias_initializer,
-                                                    prefix='mid_'))
+                                                   weight_initializer=weight_initializer,
+                                                   bias_initializer=bias_initializer,
+                                                   prefix='mid_'))
                 self.plausible_scores.add(get_activation(activation))
                 self.plausible_scores.add(nn.Dropout(dropout_prob))
                 self.plausible_scores.add(nn.Dense(2, flatten=False,
-                                                    weight_initializer=weight_initializer,
-                                                    bias_initializer=bias_initializer,
-                                                    prefix='out_'))
+                                                   weight_initializer=weight_initializer,
+                                                   bias_initializer=bias_initializer,
+                                                   prefix='out_'))
 
     def get_start_logits(self, F, contextual_embedding, p_mask):
         """
@@ -221,21 +223,19 @@ class ModelForQAConditionalV1(HybridBlock):
         answerable_logits = F.npx.log_softmax(answerable_scores, axis=-1)
         return answerable_logits
 
-
     def get_plausible_logits(self, F, contextual_embedding, p_mask, a_mask):
         neg = 1e-18
         passage_mask = F.np.expand_dims(p_mask, -1) + F.np.zeros_like(contextual_embedding)
         question_mask = F.np.expand_dims(a_mask, -1) + F.np.zeros_like(contextual_embedding)
         passage = F.np.where(passage_mask, contextual_embedding, neg)
         question = F.np.where(question_mask, contextual_embedding, neg)
-        passage  = F.npx.reshape(passage, (-2, -2, self._num_heads, -1))
+        passage = F.npx.reshape(passage, (-2, -2, self._num_heads, -1))
         question = F.npx.reshape(question, (-2, -2, self._num_heads, -1))
         context_representation, _ = self.plausible_attention(question, passage, passage)
         cls_feature = context_representation[:, 0, :]
         plausible_scores = self.plausible_scores(cls_feature)
         plausible_logits = F.npx.log_softmax(plausible_scores, axis=-1)
         return plausible_logits
-
 
     def pos_cls_verification(self, F, start_logits, contextual_embedding, p_mask):
         """
@@ -260,10 +260,10 @@ class ModelForQAConditionalV1(HybridBlock):
         """
         # As for the verifier,
         # get the probability of the first token of end_logits when srart index is 0
-        start_cls_logits = start_logits[:,0]
-        zero_index = F.np.zeros_like(start_logits[:,0:1])
+        start_cls_logits = start_logits[:, 0]
+        zero_index = F.np.zeros_like(start_logits[:, 0:1])
         end_cls_logits = self.get_end_logits(F, contextual_embedding, zero_index, p_mask)
-        end_cls_logits = F.np.squeeze(end_cls_logits, axis=1)[:,0] # Shape (batch_size, )
+        end_cls_logits = F.np.squeeze(end_cls_logits, axis=1)[:, 0]  # Shape (batch_size, )
         pos_cls_logits = start_cls_logits + end_cls_logits
         return pos_cls_logits
 
@@ -300,10 +300,10 @@ class ModelForQAConditionalV1(HybridBlock):
                                          p_mask)
         end_logits = F.np.squeeze(end_logits, axis=1)
         answerable_logits = self.get_answerable_logits(F, contextual_embeddings, p_mask)
-        plausible_logits =  self.get_plausible_logits(F, contextual_embeddings, p_mask, a_mask)
+        plausible_logits = self.get_plausible_logits(F, contextual_embeddings, p_mask, a_mask)
         return start_logits, end_logits, answerable_logits, plausible_logits
 
-    def inference(self, tokens, token_types, valid_length, p_mask,
+    def inference(self, tokens, token_types, valid_length, p_mask, a_mask,
                   start_top_n: int = 5, end_top_n: int = 5):
         """Get the inference result with beam search
 
@@ -353,8 +353,8 @@ class ModelForQAConditionalV1(HybridBlock):
         end_top_logits, end_top_index = mx.npx.topk(end_logits, k=end_top_n, axis=-1,
                                                     ret_typ='both')
         answerable_logits = self.get_answerable_logits(mx.nd, contextual_embeddings, p_mask)
-        
-        pos_cls_logits = self.pos_cls_verification(mx.nd, start_logits, contextual_embeddings, p_mask)
-
+        plausible_logits = self.get_answerable_logits(mx.nd, contextual_embeddings, p_mask, a_mask)
+        pos_cls_logits = self.pos_cls_verification(
+            mx.nd, start_logits, contextual_embeddings, p_mask)
         return start_top_logits, start_top_index, end_top_logits, end_top_index, \
-                    answerable_logits, pos_cls_logits
+            answerable_logits, plausible_logits, pos_cls_logits
