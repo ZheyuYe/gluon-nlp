@@ -130,7 +130,7 @@ class SquadDatasetProcessor:
                                            'valid_length',
                                            'segment_ids',
                                            'masks',
-                                           'answer_masks'
+                                           'answer_masks',
                                            'is_impossible',
                                            'gt_start',
                                            'gt_end',
@@ -625,11 +625,11 @@ def train(args):
                     toc = time.time()
                     logging.info(
                         'Epoch: {}, Batch: {}/{}, Loss span/answer/total={:.4f}/{:.4f}/{:.4f},'
-                        ' LR={:.8f}, grad_norm={:.4f}. Time cost={:.2f}, Throughput={:.2f} samples/s'
-                        ' Epoch ETA={:.2f}h'.format(epoch_id + 1, batch_id + 1, epoch_size, log_span_loss,
-                                                    log_answerable_loss, log_total_loss, trainer.learning_rate, total_norm,
-                                                    toc - tic, log_sample_num / (toc - tic),
-                                                    (num_train_steps - step_num) / (step_num / (toc - global_tic)) / 3600))
+                        ' LR={:.8f}, grad_norm={:.4f}. Time cost={:.2f}, Throughput={:.2f} samples/s,'
+                        ' ETA={:.2f}h'.format(epoch_id + 1, batch_id + 1, epoch_size, log_span_loss,
+                                              log_answerable_loss, log_total_loss, trainer.learning_rate, total_norm,
+                                              toc - tic, log_sample_num / (toc - tic),
+                                              (num_train_steps - step_num) / (step_num / (toc - global_tic)) / 3600))
                     tic = time.time()
                     log_span_loss = 0
                     log_answerable_loss = 0
