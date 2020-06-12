@@ -225,7 +225,12 @@ class BertModel(HybridBlock):
         self.num_token_types = num_token_types
         self.vocab_size = vocab_size
         self.units = units
+        self.hidden_size = hidden_size
+        self.num_heads = num_heads
+        self.num_layers = num_layers
         self.max_length = max_length
+        self.hidden_dropout_prob = hidden_dropout_prob
+        self.attention_dropout_prob = attention_dropout_prob
         self.activation = activation
         self.embed_initializer = embed_initializer
         self.weight_initializer = weight_initializer

@@ -444,7 +444,10 @@ class MobileBertModel(HybridBlock):
         self.vocab_size = vocab_size
         self.embed_size = embed_size
         self.units = units
+        self.num_heads = num_heads
         self.hidden_size = hidden_size
+        self.num_layers = num_layers
+        self.inner_size = inner_size
         self.max_length = max_length
         self.activation = activation
         self.num_stacked_ffn = num_stacked_ffn
