@@ -3,7 +3,7 @@ from mxnet.gluon import nn, HybridBlock
 from mxnet.util import use_np
 from gluonnlp.layers import get_activation
 from gluonnlp.op import select_vectors_by_position
-from gluonnlp.attention_cell import masked_logsoftmax, masked_softmax
+from gluonnlp.attention_cell import masked_logsoftmax, masked_softmax, MultiHeadAttentionCell
 
 
 @use_np
@@ -80,6 +80,8 @@ class ModelForQAConditionalV1(HybridBlock):
                  activation='tanh', weight_initializer=None, bias_initializer=None,
                  prefix=None, params=None):
         super().__init__(prefix=prefix, params=params)
+        self._num_heads = backbone.num_heads
+        self._dtype = backbone._dtype
         with self.name_scope():
             self.backbone = backbone
             self.start_scores = nn.Dense(1, flatten=False,
@@ -107,6 +109,29 @@ class ModelForQAConditionalV1(HybridBlock):
                 self.answerable_scores.add(get_activation(activation))
                 self.answerable_scores.add(nn.Dropout(dropout_prob))
                 self.answerable_scores.add(nn.Dense(2, flatten=False,
+                                                    weight_initializer=weight_initializer,
+                                                    bias_initializer=bias_initializer,
+                                                    prefix='out_'))
+
+            self.plausible_attention = MultiHeadAttentionCell(
+                query_units=units,
+                num_heads=self._num_heads,
+                attention_dropout=dropout_prob,
+                scaled=True,
+                dtype=self._dtype,
+                layout='NTK',
+                prefix='plausible_attention_',
+
+            )
+            self.plausible_scores = nn.HybridSequential(prefix='plausible_scores_')
+            with self.plausible_scores.name_scope():
+                self.plausible_scores.add(nn.Dense(units, flatten=False,
+                                                    weight_initializer=weight_initializer,
+                                                    bias_initializer=bias_initializer,
+                                                    prefix='mid_'))
+                self.plausible_scores.add(get_activation(activation))
+                self.plausible_scores.add(nn.Dropout(dropout_prob))
+                self.plausible_scores.add(nn.Dense(2, flatten=False,
                                                     weight_initializer=weight_initializer,
                                                     bias_initializer=bias_initializer,
                                                     prefix='out_'))
@@ -196,6 +221,22 @@ class ModelForQAConditionalV1(HybridBlock):
         answerable_logits = F.npx.log_softmax(answerable_scores, axis=-1)
         return answerable_logits
 
+
+    def get_plausible_logits(self, F, contextual_embedding, p_mask, a_mask):
+        neg = 1e-18
+        passage_mask = F.np.expand_dims(p_mask, -1) + F.np.zeros_like(contextual_embedding)
+        question_mask = F.np.expand_dims(a_mask, -1) + F.np.zeros_like(contextual_embedding)
+        passage = F.np.where(passage_mask, contextual_embedding, neg)
+        question = F.np.where(question_mask, contextual_embedding, neg)
+        passage  = F.npx.reshape(passage, (-2, -2, self._num_heads, -1))
+        question = F.npx.reshape(question, (-2, -2, self._num_heads, -1))
+        context_representation, _ = self.plausible_attention(question, passage, passage)
+        cls_feature = context_representation[:, 0, :]
+        plausible_scores = self.plausible_scores(cls_feature)
+        plausible_logits = F.npx.log_softmax(plausible_scores, axis=-1)
+        return plausible_logits
+
+
     def pos_cls_verification(self, F, start_logits, contextual_embedding, p_mask):
         """
         Verify the answerability
@@ -226,7 +267,7 @@ class ModelForQAConditionalV1(HybridBlock):
         pos_cls_logits = start_cls_logits + end_cls_logits
         return pos_cls_logits
 
-    def hybrid_forward(self, F, tokens, token_types, valid_length, p_mask, start_position):
+    def hybrid_forward(self, F, tokens, token_types, valid_length, p_mask, start_position, a_mask):
         """
 
         Parameters
@@ -242,7 +283,8 @@ class ModelForQAConditionalV1(HybridBlock):
             Shape (batch_size, sequence_length)
         start_position
             Shape (batch_size,)
-
+        a_mask
+            Shape (batch_size, sequence_length)
         Returns
         -------
         start_logits
@@ -258,7 +300,8 @@ class ModelForQAConditionalV1(HybridBlock):
                                          p_mask)
         end_logits = F.np.squeeze(end_logits, axis=1)
         answerable_logits = self.get_answerable_logits(F, contextual_embeddings, p_mask)
-        return start_logits, end_logits, answerable_logits
+        plausible_logits =  self.get_plausible_logits(F, contextual_embeddings, p_mask, a_mask)
+        return start_logits, end_logits, answerable_logits, plausible_logits
 
     def inference(self, tokens, token_types, valid_length, p_mask,
                   start_top_n: int = 5, end_top_n: int = 5):
@@ -310,7 +353,8 @@ class ModelForQAConditionalV1(HybridBlock):
         end_top_logits, end_top_index = mx.npx.topk(end_logits, k=end_top_n, axis=-1,
                                                     ret_typ='both')
         answerable_logits = self.get_answerable_logits(mx.nd, contextual_embeddings, p_mask)
-
+        
         pos_cls_logits = self.pos_cls_verification(mx.nd, start_logits, contextual_embeddings, p_mask)
+
         return start_top_logits, start_top_index, end_top_logits, end_top_index, \
                     answerable_logits, pos_cls_logits

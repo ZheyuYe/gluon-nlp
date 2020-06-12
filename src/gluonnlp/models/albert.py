@@ -207,6 +207,7 @@ class AlbertModel(HybridBlock):
         self.vocab_size = vocab_size
         self.embed_size = embed_size
         self.units = units
+        self.num_heads = num_heads
         self.max_length = max_length
         self.activation = activation
         self.embed_initializer = embed_initializer

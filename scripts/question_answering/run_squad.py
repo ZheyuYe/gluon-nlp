@@ -117,7 +117,8 @@ def parse_args():
                         help='The parameter checkpoint of backbone model')
     parser.add_argument('--all_evaluate', action='store_true',
                         help='Whether to evaluate all intermediate checkpoints instead of only last one')
-
+    parser.add_argument('--max_saved_ckpt', type=int, default=10,
+                        help='The maximum number of saved checkpoints')
     args = parser.parse_args()
     return args
 
@@ -143,7 +144,7 @@ class SquadDatasetProcessor:
                                       'valid_length': bf.Stack(),
                                       'segment_ids': bf.Pad(),
                                       'masks': bf.Pad(val=1),
-                                      'answer_masks': bf.Pad(val=1),
+                                      'answer_masks': bf.Pad(val=0),
                                       'is_impossible': bf.Stack(),
                                       'gt_start': bf.Stack(),
                                       'gt_end': bf.Stack(),
@@ -226,18 +227,24 @@ class SquadDatasetProcessor:
             valid_length = len(data)
             segment_ids = np.array([0] + [0] * len(truncated_query_ids) +
                                    [0] + [1] * chunk.length + [1], dtype=np.int32)
-            masks = np.array([0] + [1] * len(truncated_query_ids) + [1] + [0] * chunk.length + [1],
+            chunk_masks = [0] * chunk.length
+            masks = np.array([0] + [1] * len(truncated_query_ids) + [1] + chunk_masks + [1],
                              dtype=np.int32)
             context_offset = len(truncated_query_ids) + 2
-            answer_masks = masks.copy()
+            plau_chunk_masks = chunk_masks.copy()
             if chunk.start_pos is not None and chunk.end_pos is not None:
                 # Here, we increase the start and end because we put query before context
                 start_pos = chunk.start_pos + context_offset
                 end_pos = chunk.end_pos + context_offset
-                answer_masks[start_pos:end_pos+1] = 1
+                # for answer_masks 1-> not mask, 0 -> mask
+                plau_chunk_masks[chunk.start_pos:chunk.end_pos + 1] = [1] * (end_pos - start_pos + 1)
+                answer_masks = np.array([1] + [1] * len(truncated_query_ids) + [0] + plau_chunk_masks + [0],
+                                 dtype=np.int32)
             else:
                 start_pos = 0
                 end_pos = 0
+                answer_masks = np.array([1] + [1] * len(truncated_query_ids) + [0] + chunk_masks + [0],
+                                 dtype=np.int32)
 
             is_impossible = feature.is_impossible or chunk.is_impossible
             if is_impossible:
@@ -556,19 +563,21 @@ def train(args):
                 segment_ids = sample.segment_ids.as_in_ctx(ctx)
                 valid_length = sample.valid_length.as_in_ctx(ctx)
                 p_mask = sample.masks.as_in_ctx(ctx)
+                a_mask = sample.answer_masks.as_in_ctx(ctx)
                 gt_start = sample.gt_start.as_in_ctx(ctx)
                 gt_end = sample.gt_end.as_in_ctx(ctx)
                 is_impossible = sample.is_impossible.as_in_ctx(ctx).astype(np.int32)
                 batch_idx = mx.np.arange(tokens.shape[0], dtype=np.int32, ctx=ctx)
                 p_mask = 1 - p_mask  # In the network, we use 1 --> no_mask, 0 --> mask
                 with mx.autograd.record():
-                    start_logits, end_logits, answerable_logits \
-                        = qa_net(tokens, segment_ids, valid_length, p_mask, gt_start)
+                    start_logits, end_logits, answerable_logits, plausible_logits \
+                        = qa_net(tokens, segment_ids, valid_length, p_mask, gt_start, a_mask)
                     sel_start_logits = start_logits[batch_idx, gt_start]
                     sel_end_logits = end_logits[batch_idx, gt_end]
                     sel_answerable_logits = answerable_logits[batch_idx, is_impossible]
+                    sel_plausible_logits = plausible_logits[batch_idx, is_impossible]
                     span_loss = - 0.5 * (sel_start_logits + sel_end_logits).sum()
-                    answerable_loss = -0.5 * sel_answerable_logits.sum()
+                    answerable_loss = - 0.5 * 0.5 * (sel_answerable_logits + sel_plausible_logits).sum()
                     loss = (span_loss + answerable_loss) / loss_denom
                     loss_l.append(loss)
                     span_loss_l.append(span_loss)
@@ -616,7 +625,7 @@ def train(args):
                         f for f in os.listdir(
                             args.output_dir) if f.endswith('.params')]
                     # keep last 10 checkpoints
-                    if len(ckpt_candidates) > 10:
+                    if len(ckpt_candidates) > args.max_saved_ckpt:
                         ckpt_candidates.sort(key=lambda ele: (len(ele), ele))
                         os.remove(os.path.join(args.output_dir, ckpt_candidates[0]))
                     logging.info('Params saved in: {}'.format(params_saved))
@@ -725,6 +734,7 @@ def predict_extended(original_feature,
         # We use the log-likelihood as the not answerable score.
         # Thus, a high score indicates that the answer is not answerable
         cur_not_answerable_score = float(result.answerable_logits[1])
+        not_answerable_score = min(not_answerable_score, cur_not_answerable_score)
         # Calculate the start_logits + end_logits as the overall score
         context_offset = chunk_feature.context_offset
         chunk_start = chunk_feature.chunk_start
@@ -751,8 +761,6 @@ def predict_extended(original_feature,
                 all_start_idx.append(start_idx)
                 all_end_idx.append(end_idx)
                 all_pred_score.append(pred_score)
-                not_answerable_score -= float(pred_score)
-                not_answerable_score = min(not_answerable_score, cur_not_answerable_score)
     sorted_start_end_score = sorted(zip(all_start_idx, all_end_idx, all_pred_score),
                                     key=lambda args: args[-1], reverse=True)
     nbest = []
