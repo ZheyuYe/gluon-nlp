@@ -480,8 +480,13 @@ def train(args):
         num_workers=0,
         shuffle=True)
     # Froze parameters
-    if 'electra' in args.model_name and args.untunable_depth > 0:
-        untune_params(qa_net, args.untunable_depth)
+    if 'electra' in args.model_name:
+        # does not work for albert model since parameters in all layers are shared
+        if args.untunable_depth > 0:
+            untune_params(qa_net, args.untunable_depth)
+        if args.layerwise_decay > 0:
+            apply_layerwise_decay(qa_net, args.layerwise_decay)
+
     # Do not apply weight decay to all the LayerNorm and bias
     for _, v in qa_net.collect_params('.*beta|.*gamma|.*bias').items():
         v.wd_mult = 0.0
@@ -605,9 +610,6 @@ def train(args):
                     params, args.max_grad_norm * num_samples_per_update / loss_denom)
                 total_norm = total_norm / (num_samples_per_update / loss_denom)
 
-                if 'electra' not in args.model_name and args.layerwise_decay > 0:
-                    # wont work for albert model since parameters in all layers are shared
-                    apply_layerwise_decay(qa_net, args.layerwise_decay)
                 trainer.update(num_samples_per_update / loss_denom, ignore_stale_grad=True)
                 step_num += 1
                 if args.num_accumulated != 1:
