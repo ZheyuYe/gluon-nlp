@@ -1,9 +1,10 @@
 import mxnet as mx
-from mxnet.gluon import nn, HybridBlock
 from mxnet.util import use_np
-from gluonnlp.layers import get_activation
+from mxnet.gluon import HybridBlock, nn
+
 from gluonnlp.op import select_vectors_by_position
-from gluonnlp.attention_cell import masked_logsoftmax, masked_softmax, MultiHeadAttentionCell
+from gluonnlp.layers import get_activation
+from gluonnlp.attention_cell import MultiHeadAttentionCell, masked_softmax, masked_logsoftmax
 
 
 @use_np

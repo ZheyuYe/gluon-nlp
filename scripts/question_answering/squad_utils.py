@@ -462,6 +462,7 @@ def ml_voter(
         saved_path=None,
         data_file=None,
         is_training=False,
+        val_ratio=0.2,
         num_epochs=5,
         batch_size=4096):
 
@@ -484,7 +485,7 @@ def ml_voter(
 
         # training
         net.initialize()
-        train_count = int(len(X) * 0.8)
+        train_count = int(len(X) * (1 - val_ratio)))
         X_train = X[:train_count]
         X_val = X[train_count:]
         y_train = y[:train_count]
