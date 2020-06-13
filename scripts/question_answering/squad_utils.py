@@ -3,7 +3,6 @@ import os
 import re
 import json
 import time
-import bisect
 import logging
 import warnings
 import collections
@@ -18,9 +17,9 @@ from mxnet.gluon.utils import download
 
 from eval_utils import normalize_answer, make_qid_to_has_ans
 from gluonnlp.data.tokenizers import BaseTokenizerWithVocab
+from gluonnlp.utils.preprocessing import match_tokens_with_char_spans
 
-int_float_regex = re.compile(r'^\d+\.{0,1}\d*$')  # matches if a number is either integer or float
-
+int_float_regex = re.compile('^\d+\.{0,1}\d*$')  # matches if a number is either integer or float
 mx.npx.set_np()
 
 
@@ -40,7 +39,6 @@ def get_official_squad_eval_script(version='2.0', download_dir=None):
 
 class SquadExample:
     """A single training/test example for the Squad dataset, as loaded from disk."""
-
     def __init__(self, qas_id: int,
                  query_text: str,
                  context_text: str,
@@ -49,8 +47,7 @@ class SquadExample:
                  end_position: int,
                  title: str,
                  answers: Optional[List[str]] = None,
-                 is_impossible: bool = False,
-                 ):
+                 is_impossible: bool = False):
         """
 
         Parameters
@@ -309,9 +306,9 @@ def get_squad_examples_from_json(json_file: str, is_training: bool) -> List[Squa
                     answer_text=answer_text,
                     start_position=start_position,
                     end_position=end_position,
-                    answers=answers,
                     title=title,
                     is_impossible=is_impossible,
+                    answers=answers,
                 )
                 examples.append(example)
     return examples
@@ -385,16 +382,12 @@ def convert_squad_example_to_feature(example: SquadExample,
     span_start_pos, span_end_pos = None, None
     token_answer_mismatch = False
     unreliable_span = False
+    np_offsets = np.array(offsets)
     if is_training and answer_text:
         assert example.start_position >= 0 and example.end_position >= 0
-        # From the offsets, we locate the first offset that contains start_pos and the last offset
-        # that contains end_pos, i.e.
-        # offsets[lower_idx][0] <= start_pos < offsets[lower_idx][1]
-        # offsets[upper_idx][0] < end_pos <= offsets[upper_idx[1]
+        # We convert the character-level offsets to token-level offsets
         # Also, if the answer after tokenization + detokenization is not the same as the original
-        # answer,
-        offsets_lower = [offset[0] for offset in offsets]
-        offsets_upper = [offset[1] for offset in offsets]
+        # answer, we try to localize the answer text and do a rematch
         candidates = [(example.start_position, example.end_position)]
         all_possible_start_pos = {example.start_position}
         find_all_candidates = False
@@ -402,17 +395,12 @@ def convert_squad_example_to_feature(example: SquadExample,
         first_lower_idx, first_upper_idx = None, None
         while len(candidates) > 0:
             start_position, end_position = candidates.pop()
-            if end_position > offsets_upper[-1] or start_position < offsets_lower[0]:
-                # Detect the out-of-boundary case
-                warnings.warn('The selected answer is not covered by the tokens! '
-                              'Use the end_position. '
-                              'qas_id={}, context_text={}, start_pos={}, end_pos={}, '
-                              'offsets={}'.format(example.qas_id, context_text,
-                                                  start_position, end_position, offsets))
-                end_position = min(offsets_upper[-1], end_position)
-                start_position = max(offsets_lower[0], start_position)
-            lower_idx = bisect.bisect(offsets_lower, start_position) - 1
-            upper_idx = bisect.bisect_left(offsets_upper, end_position)
+            # Match the token offsets
+            token_start_ends = match_tokens_with_char_spans(np_offsets,
+                                                            np.array([[start_position,
+                                                                       end_position]]))
+            lower_idx = int(token_start_ends[0][0])
+            upper_idx = int(token_start_ends[0][1])
             if not find_all_candidates:
                 first_lower_idx = lower_idx
                 first_upper_idx = upper_idx
