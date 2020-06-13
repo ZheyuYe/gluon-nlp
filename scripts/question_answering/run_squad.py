@@ -938,7 +938,7 @@ def evaluate(args, last=True):
 
         cur_eval, revised_predictions = squad_eval(
             dev_data_path, all_predictions, na_prob, revise=na_prob is not None)
-        logging.info('The evaluated results are {}'.format(json.dumps(cur_eval)))
+        logging.info('The current evaluated results are {}'.format(json.dumps(cur_eval)))
 
         cur_metrics = 0.5 * (cur_eval[exact] + cur_eval[f1])
         if best_eval:
@@ -981,6 +981,7 @@ def evaluate(args, last=True):
         qa_net.load_parameters(ckpt_path, ctx=ctx_l, cast_dtype=True)
         best_eval = eval_validation(ckpt_name, best_eval)
 
+    logging.info('The best evaluated results are {}'.format(json.dumps(best_eval)))
     output_eval_results_file = os.path.join(args.output_dir, 'best_results.json')
     with open(output_eval_results_file, 'w') as of:
         of.write(json.dumps(best_eval, indent=4) + '\n')

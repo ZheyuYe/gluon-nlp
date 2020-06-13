@@ -410,7 +410,7 @@ def convert_squad_example_to_feature(example: SquadExample,
                               'offsets={}'.format(example.qas_id, context_text,
                                                   start_position, end_position, offsets))
                 end_position = min(offsets_upper[-1], end_position)
-                start_position = max(offsets_upper[0], start_position)
+                start_position = max(offsets_lower[0], start_position)
             lower_idx = bisect.bisect(offsets_lower, start_position) - 1
             upper_idx = bisect.bisect_left(offsets_upper, end_position)
             if not find_all_candidates:

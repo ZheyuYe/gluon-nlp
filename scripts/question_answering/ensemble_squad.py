@@ -107,6 +107,7 @@ SinglePredict = collections.namedtuple(
     ['start_idx',
      'end_idx',
      'has_score',
+     'plau_score',
      'no_score',
      'cls_score'])
 
@@ -172,6 +173,7 @@ def predict_extended(feature,
         # The second item is an additional logits represents the sum of
         # logits of the cls token in start and end positions.
         cur_not_answerable_score = float(result.answerable_logits[1])
+        plau_not_answerable_score = float(result.plausible_logits[1])
         pos_cls_score = float(result.pos_cls_logits)
         # Calculate the start_logits + end_logits as the overall score
         context_offset = chunk_feature.context_offset
@@ -201,6 +203,7 @@ def predict_extended(feature,
                     start_idx=start_idx,
                     end_idx=end_idx,
                     has_score=has_score,
+                    plau_score=plau_not_answerable_score,
                     no_score=cur_not_answerable_score,
                     cls_score=pos_cls_score,
                 )
@@ -392,13 +395,14 @@ def ensemble(args, is_save=True):
         all_scores = {}
         for qas_id, start_end_list in all_start_ends.items():
             has_ans_dict = collections.OrderedDict()
-            no_score, cls_score = 10000000, 10000000
+            no_score, cls_score, plau_score = 10000000, 10000000, 10000000
             for instance in start_end_list:
                 start = instance.start_idx
                 end = instance.end_idx
                 has_score = instance.has_score
                 cls_score = min(instance.cls_score, cls_score)
                 no_score = min(instance.no_score, no_score)
+                plau_score = min(instance.plau_score, plau_score)
 
                 if (start, end) not in has_ans_dict:
                     has_ans_dict[(start, end)] = [has_score]
@@ -415,9 +419,9 @@ def ensemble(args, is_save=True):
             else:
                 # There is no valid after inference
                 start_idx, end_idx = 0, 0
-                highest_has_score, no_score, cls_score = -10000000, 10000000, 10000000
+                highest_has_score, no_score, cls_score, plau_score = -10000000, 10000000, 10000000, 10000000
             all_predictions[qas_id] = (start_idx, end_idx)
-            all_scores[qas_id] = [highest_has_score, no_score, cls_score]
+            all_scores[qas_id] = [highest_has_score, no_score, plau_score, cls_score]
 
         return all_predictions, all_scores
 
@@ -458,8 +462,12 @@ def ensemble(args, is_save=True):
                                        context_token_offsets[end_idx][1]]
             all_predictions[qas_id] = pred_answer
 
+        cur_eval, revised_predictions = squad_eval(
+            dev_data_path, all_predictions, na_prob, revise=na_prob is not None)
+        logging.info('The current evaluated results are {}'.format(json.dumps(cur_eval)))
+
         na_prob = no_answer_score_json if args.version == '2.0' else None
-        eval_dict, revised_result = squad_eval(dev_data_path, all_predictions, na_prob, revise=True)
+        cur_eval, revised_predictions = squad_eval(dev_data_path, all_predictions, na_prob, revise=True)
 
     if is_save:
         logging.info('The evaluated files are saved in {}'.format(args.output_dir))
@@ -472,12 +480,12 @@ def ensemble(args, is_save=True):
         with open(na_prob_file, 'w') as of:
             of.write(json.dumps(no_answer_score_json, indent=4) + '\n')
         with open(revised_prediction_file, 'w') as of:
-            of.write(json.dumps(revised_result, indent=4) + '\n')
+            of.write(json.dumps(revised_predictions, indent=4) + '\n')
 
-    logging.info('The evaluated results are {}'.format(json.dumps(eval_dict)))
+    logging.info('The evaluated results are {}'.format(json.dumps(cur_eval)))
     output_eval_results_file = os.path.join(args.output_dir, 'results.json')
     with open(output_eval_results_file, 'w') as of:
-        of.write(json.dumps(eval_dict, indent=4) + '\n')
+        of.write(json.dumps(cur_eval, indent=4) + '\n')
 
 
 if __name__ == '__main__':
