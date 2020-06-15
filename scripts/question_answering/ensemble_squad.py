@@ -108,6 +108,7 @@ SinglePredict = collections.namedtuple(
      'end_idx',
      'has_score',
      'no_score',
+     'plau_score',
      'cls_score'])
 
 
@@ -172,6 +173,7 @@ def predict_extended(feature,
         # The second item is an additional logits represents the sum of
         # logits of the cls token in start and end positions.
         cur_not_answerable_score = float(result.answerable_logits[1])
+        plau_score = float(result.plausible_logits[1])
         pos_cls_score = float(result.pos_cls_logits)
         # Calculate the start_logits + end_logits as the overall score
         context_offset = chunk_feature.context_offset
@@ -201,6 +203,7 @@ def predict_extended(feature,
                     start_idx=start_idx,
                     end_idx=end_idx,
                     has_score=has_score,
+                    plau_score=plau_score,
                     no_score=cur_not_answerable_score,
                     cls_score=pos_cls_score,
                 )
@@ -261,6 +264,7 @@ def inference(args, qa_model, features, dataset_processor):
                                            end_top_logits=end_top_logits[i].asnumpy(),
                                            end_top_index=end_top_index[i].asnumpy(),
                                            answerable_logits=answerable_logits[i].asnumpy(),
+                                           plausible_logits=plausible_logits[i].asnumpy(),
                                            pos_cls_logits=pos_cls_logits[i].asnumpy())
 
                 all_results.append(result)
@@ -446,7 +450,7 @@ def ensemble(args, is_save=True):
 
         # Update the results step step
         all_predictions, all_scores = scatter_and_update(dev_start_ends, idx + 1)
-        dev_scores_file = os.path.join(args.output_dir, 'dev_scores-{}.json'.format())
+        dev_scores_file = os.path.join(args.output_dir, 'dev_scores-{}.json'.format(idx))
         with open(dev_scores_file, 'w') as of:
             of.write(json.dumps(all_scores, indent=4) + '\n')
         no_answer_score_json = ml_voter(all_scores, ml_voter_path, is_training=False)
