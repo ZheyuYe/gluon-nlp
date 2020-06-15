@@ -261,6 +261,7 @@ def inference(args, qa_model, features, dataset_processor):
                                            end_top_logits=end_top_logits[i].asnumpy(),
                                            end_top_index=end_top_index[i].asnumpy(),
                                            answerable_logits=answerable_logits[i].asnumpy(),
+                                           plausible_logits=plausible_logits[i].asnumpy(),
                                            pos_cls_logits=pos_cls_logits[i].asnumpy())
 
                 all_results.append(result)
