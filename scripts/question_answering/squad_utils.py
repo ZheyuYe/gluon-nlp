@@ -485,7 +485,7 @@ def ml_voter(
 
         # training
         net.initialize()
-        train_count = int(len(X) * (1 - val_ratio)))
+        train_count = int(len(X) * (1 - val_ratio))
         X_train = X[:train_count]
         X_val = X[train_count:]
         y_train = y[:train_count]
