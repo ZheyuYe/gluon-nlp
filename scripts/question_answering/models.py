@@ -225,14 +225,15 @@ class ModelForQAConditionalV1(HybridBlock):
         return answerable_logits
 
     def get_plausible_logits(self, F, contextual_embedding, p_mask, a_mask):
-        neg = 1e-18
-        passage_mask = F.np.expand_dims(p_mask, -1) + F.np.zeros_like(contextual_embedding)
-        question_mask = F.np.expand_dims(a_mask, -1) + F.np.zeros_like(contextual_embedding)
-        passage = F.np.where(passage_mask, contextual_embedding, neg)
-        question = F.np.where(question_mask, contextual_embedding, neg)
-        passage = F.npx.reshape(passage, (-2, -2, self._num_heads, -1))
-        question = F.npx.reshape(question, (-2, -2, self._num_heads, -1))
-        context_representation, _ = self.plausible_attention(passage, question, question)
+        mask = F.np.expand_dims(p_mask, 1) * F.np.expand_dims(a_mask, -1)
+        data = F.npx.reshape(contextual_embedding, (-2, -2, self._num_heads, -1))
+        context_representation, _ = self.plausible_attention(data, data, data, mask)
+        # represents the revised attented hidden states of question and answers as
+        # CLS, Question, SEP, Context, SEP
+        # 1,   1,        0,   0,       0
+
+        # TODO(zheyuye), adding masking for context_representation if we choose advanced features
+        # instead of only [CLS] that used in answerable_scores raising a concern of independence.
         cls_feature = context_representation[:, 0, :]
         plausible_scores = self.plausible_scores(cls_feature)
         plausible_logits = F.npx.log_softmax(plausible_scores, axis=-1)
