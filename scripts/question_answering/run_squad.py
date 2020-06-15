@@ -739,7 +739,7 @@ def predict_extended(original_feature,
         # Thus, a high score indicates that the answer is not answerable
         cur_not_answerable_score = float(
             result.answerable_logits[1] +
-            result.answerable_logits[1] +
+            result.plausible_logits[1] +
             result.pos_cls_logits)
         not_answerable_score = min(not_answerable_score, cur_not_answerable_score)
         # Calculate the start_logits + end_logits as the overall score
