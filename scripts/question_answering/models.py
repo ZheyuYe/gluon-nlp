@@ -232,7 +232,7 @@ class ModelForQAConditionalV1(HybridBlock):
         question = F.np.where(question_mask, contextual_embedding, neg)
         passage = F.npx.reshape(passage, (-2, -2, self._num_heads, -1))
         question = F.npx.reshape(question, (-2, -2, self._num_heads, -1))
-        context_representation, _ = self.plausible_attention(question, passage, passage)
+        context_representation, _ = self.plausible_attention(passage, question, question)
         cls_feature = context_representation[:, 0, :]
         plausible_scores = self.plausible_scores(cls_feature)
         plausible_logits = F.npx.log_softmax(plausible_scores, axis=-1)
