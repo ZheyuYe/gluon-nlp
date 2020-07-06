@@ -523,8 +523,6 @@ def train(args):
             grouper(repeat(train_dataloader), len(ctx_l) * args.num_accumulated)):
         for sample_l in grouper(batch_data, len(ctx_l)):
             loss_l = []
-            span_loss_l = []
-            answerable_loss_l = []
             for sample, ctx in zip(sample_l, ctx_l):
                 if sample is None:
                     continue
@@ -535,8 +533,6 @@ def train(args):
                 segment_ids = sample.segment_ids.as_in_ctx(ctx) if use_segmentation else None
                 valid_length = sample.valid_length.as_in_ctx(ctx)
                 p_mask = sample.masks.as_in_ctx(ctx)
-                gt_start = sample.gt_start.as_in_ctx(ctx)
-                gt_end = sample.gt_end.as_in_ctx(ctx)
                 is_impossible = sample.is_impossible.as_in_ctx(ctx).astype(np.int32)
                 batch_idx = mx.np.arange(tokens.shape[0], dtype=np.int32, ctx=ctx)
                 p_mask = 1 - p_mask  # In the network, we use 1 --> no_mask, 0 --> mask
@@ -654,24 +650,6 @@ def predict_extended(original_feature,
     not_answerable_score = 1000000  # Score for not-answerable. We set it to be a large and positive
     # If one chunk votes for answerable, we will treat the context as answerable,
     # Thus, the overall not_answerable_score = min(chunk_not_answerable_score)
-    all_start_idx = []
-    all_end_idx = []
-    all_pred_score = []
-    context_length = len(original_feature.context_token_ids)
-    token_max_context_score = np.full((len(chunked_features), context_length),
-                                      -np.inf,
-                                      dtype=np.float32)
-    for i, chunked_feature in enumerate(chunked_features):
-        chunk_start = chunked_feature.chunk_start
-        chunk_length = chunked_feature.chunk_length
-        for j in range(chunk_start, chunk_start + chunk_length):
-            # This is a heuristic score
-            # TODO investigate the impact
-            token_max_context_score[i, j] = min(j - chunk_start,
-                                                chunk_start + chunk_length - 1 - j) \
-                + 0.01 * chunk_length
-    token_max_chunk_id = token_max_context_score.argmax(axis=0)
-
     for chunk_id, (result, chunk_feature) in enumerate(zip(results, chunked_features)):
         # We use the log-likelihood as the not answerable score.
         # Thus, a high score indicates that the answer is not answerable
@@ -775,8 +753,6 @@ def evaluate(args, last=True):
         logging.info('Time cost=%2f s, Thoughput=%.2f samples/s', epoch_toc - epoch_tic,
                      total_num / (epoch_toc - epoch_tic))
 
-        all_predictions = collections.OrderedDict()
-        all_nbest_json = collections.OrderedDict()
         no_answer_score_json = collections.OrderedDict()
         for index, (left_index, right_index) in enumerate(zip(dev_chunk_feature_ptr[:-1],
                                                               dev_chunk_feature_ptr[1:])):

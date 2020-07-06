@@ -286,13 +286,13 @@ def answerable_eval(data_file, na_probs, na_prob_thresh=0.0):
             # For the answerable question
             diff = 1
         else:
-            diff = 0
+            diff = -1
         cur_score += diff
         if cur_score > best_score:
             # adjust the best thresh over current thresh (na_probs[qid])
             best_score = cur_score
             best_thresh = na_probs[qid]
 
-    out_eval = {'accuracy': best_score,
+    out_eval = {'accuracy': best_score / len(qid_to_has_ans),
                 'best_thresh': best_thresh}
     return out_eval

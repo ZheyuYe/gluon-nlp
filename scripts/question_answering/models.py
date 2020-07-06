@@ -19,10 +19,6 @@ class ModelForAnswerable(HybridBlock):
         with self.name_scope():
             self.backbone = backbone
             self.use_segmentation = use_segmentation
-            self.answerable_score = nn.Dense(units=2, flatten=False,
-                                              weight_initializer=weight_initializer,
-                                              bias_initializer=bias_initializer,
-                                              prefix='answerable_logits_')
             self.answerable_attention = MultiHeadAttentionCell(
                 query_units=units,
                 num_heads=self._num_heads,
@@ -77,8 +73,8 @@ class ModelForAnswerable(HybridBlock):
 
         # TODO(zheyuye), adding masking for context_representation if we choose advanced features
         # instead of only [CLS] that used in answerable_scores raising a concern of independence.
-        cls_feature = context_representations[:, 0, :]
-        answerable_scores = self.answerable_score(cls_feature)
+        cls_feature = context_representation[:, 0, :]
+        answerable_scores = self.answerable_scores(cls_feature)
         answerable_logits = F.npx.log_softmax(answerable_scores, axis=-1, )
         return answerable_logits
 
