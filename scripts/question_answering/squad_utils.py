@@ -113,8 +113,8 @@ class SquadExample:
 
 DocChunk = namedtuple('DocChunk', ['start', 'length',
                                    'is_impossible',
-                                   'gt_start_pos',
-                                   'gt_end_pos'])
+                                   'start_pos',
+                                   'end_pos'])
 
 
 class SquadFeature:
@@ -126,11 +126,10 @@ class SquadFeature:
                  is_impossible,
                  token_answer_mismatch,
                  unreliable_span,
-                 gt_answer_text,
-                 gt_start_pos,
-                 gt_end_pos):
+                 answer_text,
+                 start_pos,
+                 end_pos):
         """The Squad Feature
-
         Parameters
         ----------
         qas_id
@@ -155,18 +154,17 @@ class SquadFeature:
                      "one"                       "iPhone"
                      "breed"                     "breeding"
                      "emotion"                   "emotional"
-
         unreliable_span
-            If this value is True, it means that we cannot rely on the gt_start_pos and gt_end_pos.
+            If this value is True, it means that we cannot rely on the start_pos and end_pos.
             In this scenario, we cannot utilize the span-prediction-based approach.
             One example is the question about "how many", the answer will spread across the
             whole document and there is no clear span.
-        gt_answer_text
+        answer_text
             The ground-truth answer text
-        gt_start_pos
+        start_pos
             The start position of the ground-truth span. None indicates that there is no valid
             ground-truth span.
-        gt_end_pos
+        end_pos
             The end position of the ground-truth span. None indicates that there is no valid
             ground-truth span.
         """
@@ -178,9 +176,9 @@ class SquadFeature:
         self.is_impossible = is_impossible
         self.token_answer_mismatch = token_answer_mismatch
         self.unreliable_span = unreliable_span
-        self.gt_answer_text = gt_answer_text
-        self.gt_start_pos = gt_start_pos
-        self.gt_end_pos = gt_end_pos
+        self.answer_text = answer_text
+        self.start_pos = start_pos
+        self.end_pos = end_pos
 
     def to_json(self):
         return json.dumps(self.__dict__)
@@ -231,30 +229,42 @@ class SquadFeature:
         ret = []
         while doc_ptr < len(self.context_token_ids):
             chunk_length = min(max_chunk_length, len(self.context_token_ids) - doc_ptr)
-            if self.gt_answer_text is None:
-                chunk_gt_start_pos = None
-                chunk_gt_end_pos = None
+            if self.answer_text is None:
+                chunk_start_pos = None
+                chunk_end_pos = None
                 chunk_is_impossible = True
             else:
-                if self.gt_start_pos is not None and self.gt_end_pos is not None and\
-                        self.gt_start_pos >= doc_ptr and self.gt_end_pos < doc_ptr + chunk_length:
+                if self.start_pos is not None and self.end_pos is not None and\
+                        self.start_pos >= doc_ptr and self.end_pos < doc_ptr + chunk_length:
                     # The chunk contains the ground-truth annotation
-                    chunk_gt_start_pos = self.gt_start_pos - doc_ptr
-                    chunk_gt_end_pos = self.gt_end_pos - doc_ptr
+                    chunk_start_pos = self.start_pos - doc_ptr
+                    chunk_end_pos = self.end_pos - doc_ptr
                     chunk_is_impossible = False
                 else:
-                    chunk_gt_start_pos = None
-                    chunk_gt_end_pos = None
+                    chunk_start_pos = None
+                    chunk_end_pos = None
                     chunk_is_impossible = True
             ret.append(DocChunk(start=doc_ptr,
                                 length=chunk_length,
                                 is_impossible=chunk_is_impossible,
-                                gt_start_pos=chunk_gt_start_pos,
-                                gt_end_pos=chunk_gt_end_pos))
+                                start_pos=chunk_start_pos,
+                                end_pos=chunk_end_pos))
             if doc_ptr + chunk_length == len(self.context_token_ids):
                 break
             doc_ptr += doc_stride
         return ret
+
+
+def get_answers_from_qa(answer, context_text, qas_id):
+    answer_text = answer["text"]
+    start_position = answer["answer_start"]
+    end_position = start_position + len(answer_text)
+    if context_text[start_position:end_position] != answer_text:
+        warnings.warn(
+            'Mismatch start/end and answer_text, start/end={}/{},'
+            ' answer text={}. qas={}'
+            .format(start_position, end_position, answer_text, qas_id))
+    return answer_text, start_position, end_position
 
 
 def get_squad_examples_from_json(json_file: str, is_training: bool) -> List[SquadExample]:
@@ -292,19 +302,21 @@ def get_squad_examples_from_json(json_file: str, is_training: bool) -> List[Squa
                 else:
                     is_impossible = False
 
-                if not is_impossible:
-                    if is_training:
-                        answer = qa["answers"][0]
-                        answer_text = answer["text"]
-                        start_position = answer["answer_start"]
-                        end_position = start_position + len(answer_text)
-                        if context_text[start_position:end_position] != answer_text:
-                            warnings.warn(
-                                'Mismatch start/end and answer_text, start/end={}/{},'
-                                ' answer text={}. qas={}'
-                                .format(start_position, end_position, answer_text, qas_id))
+                if is_training:
+                    if not is_impossible:
+                        answers = qa["answers"][0]
+                        answer_text, start_position, end_position = \
+                            get_answers_from_qa(answers, context_text, qas_id)
                     else:
-                        answers = qa["answers"]
+                        # For the case of impossible question, the SQuAD2.0 offers plausible_answers
+                        # with proper grammatical structure that fit the question to fool the model
+                        answers = qa["plausible_answers"][0]
+                        answer_text, start_position, end_position = \
+                            get_answers_from_qa(answers, context_text, qas_id)
+
+                else:
+                    answers = qa["answers"]
+
                 example = SquadExample(
                     qas_id=qas_id,
                     query_text=query_text,
@@ -385,12 +397,11 @@ def convert_squad_example_to_feature(example: SquadExample,
     query_text = example.query_text
     context_token_ids, offsets = tokenizer.encode_with_offsets(context_text, int)
     query_token_ids = tokenizer.encode(query_text, int)
-    gt_answer_text = answer_text
-    gt_span_start_pos, gt_span_end_pos = None, None
+    span_start_pos, span_end_pos = None, None
     token_answer_mismatch = False
     unreliable_span = False
     np_offsets = np.array(offsets)
-    if is_training and not example.is_impossible:
+    if is_training and answer_text:
         assert example.start_position >= 0 and example.end_position >= 0
         # We convert the character-level offsets to token-level offsets
         # Also, if the answer after tokenization + detokenization is not the same as the original
@@ -438,8 +449,8 @@ def convert_squad_example_to_feature(example: SquadExample,
             else:
                 break
 
-        gt_span_start_pos = lower_idx
-        gt_span_end_pos = upper_idx
+        span_start_pos = lower_idx
+        span_end_pos = upper_idx
 
     feature = SquadFeature(qas_id=example.qas_id,
                            query_token_ids=query_token_ids,
@@ -449,7 +460,101 @@ def convert_squad_example_to_feature(example: SquadExample,
                            is_impossible=example.is_impossible,
                            token_answer_mismatch=token_answer_mismatch,
                            unreliable_span=unreliable_span,
-                           gt_answer_text=gt_answer_text,
-                           gt_start_pos=gt_span_start_pos,
-                           gt_end_pos=gt_span_end_pos)
+                           answer_text=answer_text,
+                           start_pos=span_start_pos,
+                           end_pos=span_end_pos)
     return feature
+
+
+class MLP(HybridBlock):
+    def __init__(self, **kwargs):
+        super(MLP, self).__init__(**kwargs)
+        self.output = nn.Dense(1, use_bias=False)
+
+    def hybrid_forward(self, F, x):
+        return self.output(x)
+
+
+def ml_voter(
+        all_scores,
+        saved_path=None,
+        data_file=None,
+        is_training=False,
+        val_ratio=0.2,
+        num_epochs=5,
+        batch_size=4096):
+
+    X = mx.np.array(list(all_scores.values()), dtype=np.float32)
+
+    net = MLP()
+    if is_training:
+        # prepare dataset
+        assert data_file is not None, 'data_file must be provided for training'
+        if isinstance(data_file, str):
+            with open(data_file) as f:
+                dataset_json = json.load(f)
+                dataset = dataset_json['data']
+        elif isinstance(data_file, list):
+            dataset = data_file
+
+        qid_to_has_ans = make_qid_to_has_ans(dataset)  # maps qid to True/False
+        assert list(all_scores.keys()) == list(qid_to_has_ans.keys())
+        y = mx.np.array(list(qid_to_has_ans.values()), dtype=np.int32)
+
+        # training
+        net.initialize()
+        train_count = int(len(X) * (1 - val_ratio))
+        X_train = X[:train_count]
+        X_val = X[train_count:]
+        y_train = y[:train_count]
+        y_val = y[train_count:]
+        train_dataset = mx.gluon.data.dataset.ArrayDataset(X_train, y_train)
+        val_dataset = mx.gluon.data.dataset.ArrayDataset(X_val, y_val)
+        train_data_loader = mx.gluon.data.DataLoader(train_dataset, batch_size=batch_size)
+        val_data_loader = mx.gluon.data.DataLoader(val_dataset, batch_size=batch_size)
+
+        BCELoss = mx.gluon.loss.SigmoidBinaryCrossEntropyLoss()
+        trainer = mx.gluon.Trainer(net.collect_params(), 'sgd', {'learning_rate': 0.1})
+
+        def acc(output, labels):
+            # output: (batch, num_output) float32 ndarray
+            # label: (batch, ) int32 ndarray
+            probs = output.squeeze(-1)
+            preds = mx.np.round((mx.np.sign(probs) + 1) / 2).astype(np.int32)
+
+            weights = mx.np.ones_like(labels)
+            is_correct = mx.np.equal(labels, preds)
+            acc = (is_correct * weights).sum() / (weights.sum() + 1e-6)
+            return acc
+        logging.info('String training a simple MLP-based voter')
+        for epoch in range(num_epochs):
+            train_loss, train_acc, valid_acc = 0., 0., 0.
+            tic = time.time()
+            for data, label in train_data_loader:
+                # forward + backward
+                with mx.autograd.record():
+                    output = net(data)
+                    loss = BCELoss(output, label)
+                loss.backward()
+                # update parameters
+                trainer.step(batch_size)
+                # calculate training metrics
+                train_loss += loss.mean().asnumpy()
+                train_acc += acc(output, label)
+            # calculate validation accuracy
+            for data, label in val_data_loader:
+                valid_acc += acc(net(data), label)
+            logging.info("Epoch %d: loss %.3f, train acc %.3f, test acc %.3f, in %.1f sec" % (
+                epoch, train_loss / len(train_data_loader), train_acc / len(train_data_loader),
+                valid_acc / len(val_data_loader), time.time() - tic))
+        logging.info('Save voter parameters at {}'.format(saved_path))
+        net.save_parameters(saved_path)
+    else:
+        # Inference
+        logging.info('Load voter parameters from {}'.format(saved_path))
+        net.load_parameters(saved_path)
+        results = net(X)
+        no_answer_score_json = collections.OrderedDict()
+        for i, qid in enumerate(all_scores.keys()):
+            no_answer_score_json[qid] = - results[i].item()
+        return no_answer_score_json

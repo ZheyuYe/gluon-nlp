@@ -164,6 +164,7 @@ class SquadDatasetProcessor:
                                                     'valid_length',
                                                     'segment_ids',
                                                     'masks',
+                                                    'answer_masks',
                                                     'is_impossible',
                                                     'gt_start',
                                                     'gt_end',
@@ -176,6 +177,7 @@ class SquadDatasetProcessor:
                                                'valid_length': bf.Stack(),
                                                'segment_ids': bf.Pad(),
                                                'masks': bf.Pad(val=1),
+                                               'answer_masks': bf.Pad(val=0),
                                                'is_impossible': bf.Stack(),
                                                'gt_start': bf.Stack(),
                                                'gt_end': bf.Stack(),
@@ -241,19 +243,32 @@ class SquadDatasetProcessor:
             masks = np.array([0] + [1] * len(truncated_query_ids) + [1] + [0] * chunk.length + [1],
                              dtype=np.int32)
             context_offset = len(truncated_query_ids) + 2
-            if chunk.gt_start_pos is None and chunk.gt_end_pos is None:
+            plau_chunk_masks = chunk_masks.copy()
+            if chunk.start_pos is not None and chunk.end_pos is not None:
+                # Here, we increase the start and end because we put query before context
+                start_pos = chunk.start_pos + context_offset
+                end_pos = chunk.end_pos + context_offset
+                # for answer_masks 1-> not mask, 0 -> mask
+                plau_chunk_masks[chunk.start_pos:chunk.end_pos + 1] = [1] * (end_pos - start_pos + 1)
+                answer_masks = np.array([1] + [1] * len(truncated_query_ids) + [0] + plau_chunk_masks + [0],
+                                 dtype=np.int32)
+            else:
                 start_pos = 0
                 end_pos = 0
-            else:
-                # Here, we increase the start and end because we put query before context
-                start_pos = chunk.gt_start_pos + context_offset
-                end_pos = chunk.gt_end_pos + context_offset
+                answer_masks = np.array([1] + [1] * len(truncated_query_ids) + [0] + chunk_masks + [0],
+                                 dtype=np.int32)
+            is_impossible = feature.is_impossible or chunk.is_impossible
+            if is_impossible:
+                start_pos = 0
+                end_pos = 0
+
             chunk_feature = self.ChunkFeature(qas_id=feature.qas_id,
                                               data=data,
                                               valid_length=valid_length,
                                               segment_ids=segment_ids,
                                               masks=masks,
-                                              is_impossible=chunk.is_impossible,
+                                              answer_masks=answer_masks,
+                                              is_impossible=is_impossible,
                                               gt_start=start_pos,
                                               gt_end=end_pos,
                                               context_offset=context_offset,
@@ -533,11 +548,12 @@ def train(args):
                 segment_ids = sample.segment_ids.as_in_ctx(ctx) if use_segmentation else None
                 valid_length = sample.valid_length.as_in_ctx(ctx)
                 p_mask = sample.masks.as_in_ctx(ctx)
+                a_mask = sample.answer_masks.as_in_ctx(ctx)
                 is_impossible = sample.is_impossible.as_in_ctx(ctx).astype(np.int32)
                 batch_idx = mx.np.arange(tokens.shape[0], dtype=np.int32, ctx=ctx)
                 p_mask = 1 - p_mask  # In the network, we use 1 --> no_mask, 0 --> mask
                 with mx.autograd.record():
-                    answerable_logits = qa_net(tokens, segment_ids, valid_length, p_mask)
+                    answerable_logits = qa_net(tokens, segment_ids, valid_length, p_mask, a_mask)
                     sel_answerable_logits = answerable_logits[batch_idx, is_impossible]
                     answerable_loss = - 0.5 * sel_answerable_logits.sum()
                     loss = answerable_loss / loss_denom
@@ -729,8 +745,9 @@ def evaluate(args, last=True):
                 segment_ids = sample.segment_ids.as_in_ctx(ctx) if use_segmentation else None
                 valid_length = sample.valid_length.as_in_ctx(ctx)
                 p_mask = sample.masks.as_in_ctx(ctx)
+                a_mask = sample.answer_masks.as_in_ctx(ctx)
                 p_mask = 1 - p_mask  # In the network, we use 1 --> no_mask, 0 --> mask
-                answerable_logits = qa_net(tokens, segment_ids, valid_length,  p_mask)
+                answerable_logits = qa_net(tokens, segment_ids, valid_length, p_mask, a_mask)
                 for i, qas_id in enumerate(sample.qas_id):
                     result = RawResultExtended(qas_id=qas_id,
                                                answerable_logits=answerable_logits[i].asnumpy())
