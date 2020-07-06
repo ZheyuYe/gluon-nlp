@@ -247,3 +247,52 @@ def squad_eval(data_file, preds, na_probs, na_prob_thresh=0.0, revise=False):
         return out_eval, preds_out
     else:
         return out_eval, preds
+
+def answerable_eval(data_file, na_probs, na_prob_thresh=0.0):
+    """
+
+    Parameters
+    ----------
+    data_file
+        dataset(list) or data_file(str)
+    na_probs
+        probabilities dict of unanswerable
+    na_prob_thresh
+        threshold of unanswerable
+    Returns
+    -------
+        out_eval
+            A dictionary of output results
+    """
+    if isinstance(data_file, str):
+        with open(data_file) as f:
+            dataset_json = json.load(f)
+            dataset = dataset_json['data']
+    elif isinstance(data_file, list):
+        dataset = data_file
+
+    qid_to_has_ans = make_qid_to_has_ans(dataset)  # maps qid to True/False
+    has_ans_qids = [k for k, v in qid_to_has_ans.items() if v]
+    no_ans_qids = [k for k, v in qid_to_has_ans.items() if not v]
+
+    cur_score = len(no_ans_qids)
+    best_score = cur_score
+    best_thresh = 0.0
+    # Rearrange the na_probs in an ascending order, so that the questions
+    # with higher probability of answerability the sooner will be read.
+    qid_list = sorted(na_probs, key=lambda k: na_probs[k])
+    for i, qid in enumerate(qid_list):
+        if qid_to_has_ans[qid]:
+            # For the answerable question
+            diff = 1
+        else:
+            diff = 0
+        cur_score += diff
+        if cur_score > best_score:
+            # adjust the best thresh over current thresh (na_probs[qid])
+            best_score = cur_score
+            best_thresh = na_probs[qid]
+
+    out_eval = {'accuracy': best_score,
+                'best_thresh': best_thresh}
+    return out_eval

@@ -5,6 +5,51 @@ from gluonnlp.layers import get_activation
 from gluonnlp.op import select_vectors_by_position
 from gluonnlp.attention_cell import masked_logsoftmax, masked_softmax
 
+@use_np
+class ModelForAnswerable(HybridBlock):
+    """A naive model model for Question Answering that only aim at the binary classification of
+    answerable questions.
+    """
+    def __init__(self, backbone, weight_initializer=None, bias_initializer=None,
+                 use_segmentation=True, prefix=None, params=None):
+        super().__init__(prefix=prefix, params=params)
+        with self.name_scope():
+            self.backbone = backbone
+            self.use_segmentation = use_segmentation
+            self.answerable_score = nn.Dense(units=2, flatten=False,
+                                              weight_initializer=weight_initializer,
+                                              bias_initializer=bias_initializer,
+                                              prefix='answerable_logits_')
+
+    def hybrid_forward(self, F, tokens, token_types, valid_length):
+        """
+
+        Parameters
+        ----------
+        F
+        tokens
+            Shape (batch_size, sequence_length)
+        token_types
+            Shape (batch_size, sequence_length)
+        valid_length
+            Shape (batch_size,)
+        p_mask
+            Shape (batch_size, sequence_length)
+        start_position
+            Shape (batch_size,)
+
+        Returns
+        -------
+        answerable_logits
+        """
+        if self.use_segmentation:
+            contextual_embeddings = self.backbone(tokens, token_types, valid_length)
+        else:
+            contextual_embeddings = self.backbone(tokens, valid_length)
+        first_token_embedding = contextual_embeddings[:, 0, :]
+        answerable_scores = self.answerable_score(first_token_embedding)
+        answerable_logits = F.npx.log_softmax(answerable_scores, axis=-1)
+        return answerable_logits
 
 @use_np
 class ModelForQABasic(HybridBlock):
