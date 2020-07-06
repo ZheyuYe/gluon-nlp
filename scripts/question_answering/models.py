@@ -13,6 +13,8 @@ class ModelForAnswerable(HybridBlock):
     def __init__(self, backbone, weight_initializer=None, bias_initializer=None,
                  use_segmentation=True, prefix=None, params=None):
         super().__init__(prefix=prefix, params=params)
+        self._num_heads = backbone.num_heads
+        self._dtype = backbone._dtype
         with self.name_scope():
             self.backbone = backbone
             self.use_segmentation = use_segmentation
@@ -20,8 +22,29 @@ class ModelForAnswerable(HybridBlock):
                                               weight_initializer=weight_initializer,
                                               bias_initializer=bias_initializer,
                                               prefix='answerable_logits_')
+            self.answerable_attention = MultiHeadAttentionCell(
+                query_units=units,
+                num_heads=self._num_heads,
+                attention_dropout=dropout_prob,
+                scaled=True,
+                dtype=self._dtype,
+                layout='NTK',
+                prefix='answerable_attention_',
+            )
+            self.answerable_scores = nn.HybridSequential(prefix='answerable_scores_')
+            with self.answerable_scores.name_scope():
+                self.answerable_scores.add(nn.Dense(units, flatten=False,
+                                                   weight_initializer=weight_initializer,
+                                                   bias_initializer=bias_initializer,
+                                                   prefix='mid_'))
+                self.answerable_scores.add(get_activation(activation))
+                self.answerable_scores.add(nn.Dropout(dropout_prob))
+                self.answerable_scores.add(nn.Dense(2, flatten=False,
+                                                   weight_initializer=weight_initializer,
+                                                   bias_initializer=bias_initializer,
+                                                   prefix='out_'))
 
-    def hybrid_forward(self, F, tokens, token_types, valid_length):
+    def hybrid_forward(self, F, tokens, token_types, valid_length, p_mask):
         """
 
         Parameters
@@ -35,8 +58,6 @@ class ModelForAnswerable(HybridBlock):
             Shape (batch_size,)
         p_mask
             Shape (batch_size, sequence_length)
-        start_position
-            Shape (batch_size,)
 
         Returns
         -------
@@ -46,10 +67,20 @@ class ModelForAnswerable(HybridBlock):
             contextual_embeddings = self.backbone(tokens, token_types, valid_length)
         else:
             contextual_embeddings = self.backbone(tokens, valid_length)
-        first_token_embedding = contextual_embeddings[:, 0, :]
-        answerable_scores = self.answerable_score(first_token_embedding)
-        answerable_logits = F.npx.log_softmax(answerable_scores, axis=-1)
+        mask = F.np.expand_dims(p_mask, 1) * F.np.expand_dims(F.ones_like(p_mask), -1)
+        data = F.npx.reshape(contextual_embedding, (-2, -2, self._num_heads, -1))
+        context_representation, _ = self.answerable_attention(data, data, data, mask)
+        # represents the revised attented hidden states of question and answers as
+        # CLS, Question, SEP, Context, SEP
+        # 1,   1,        0,   0,       0
+
+        # TODO(zheyuye), adding masking for context_representation if we choose advanced features
+        # instead of only [CLS] that used in answerable_scores raising a concern of independence.
+        cls_feature = context_representations[:, 0, :]
+        answerable_scores = self.answerable_score(cls_feature)
+        answerable_logits = F.npx.log_softmax(answerable_scores, axis=-1, )
         return answerable_logits
+
 
 @use_np
 class ModelForQABasic(HybridBlock):

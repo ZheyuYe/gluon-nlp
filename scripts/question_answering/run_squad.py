@@ -706,7 +706,7 @@ def predict_extended(original_feature,
                 pred_score = result.start_top_logits[i] + result.end_top_logits[i, j]
                 start_index = result.start_top_index[i]
                 end_index = result.end_top_index[i, j]
-                # We could hypothetically create invalid predictions, e.g., predict
+                # We could hypothetically create invalid predictions, e.g. predict
                 # that the start of the answer span is in the query tokens or out of
                 # the chunk. We throw out all invalid predictions.
                 if not (context_offset <= start_index < context_offset + chunk_length) or \

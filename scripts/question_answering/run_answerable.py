@@ -533,12 +533,14 @@ def train(args):
                 num_samples_per_update += len(tokens)
                 segment_ids = sample.segment_ids.as_in_ctx(ctx) if use_segmentation else None
                 valid_length = sample.valid_length.as_in_ctx(ctx)
+                p_mask = sample.masks.as_in_ctx(ctx)
                 gt_start = sample.gt_start.as_in_ctx(ctx)
                 gt_end = sample.gt_end.as_in_ctx(ctx)
                 is_impossible = sample.is_impossible.as_in_ctx(ctx).astype(np.int32)
                 batch_idx = mx.np.arange(tokens.shape[0], dtype=np.int32, ctx=ctx)
+                p_mask = 1 - p_mask  # In the network, we use 1 --> no_mask, 0 --> mask
                 with mx.autograd.record():
-                    answerable_logits = qa_net(tokens, segment_ids, valid_length)
+                    answerable_logits = qa_net(tokens, segment_ids, valid_length, p_mask)
                     sel_answerable_logits = answerable_logits[batch_idx, is_impossible]
                     answerable_loss = - 0.5 * sel_answerable_logits.sum()
                     loss = answerable_loss / loss_denom
@@ -747,7 +749,9 @@ def evaluate(args, last=True):
                 log_num += len(tokens)
                 segment_ids = sample.segment_ids.as_in_ctx(ctx) if use_segmentation else None
                 valid_length = sample.valid_length.as_in_ctx(ctx)
-                answerable_logits = qa_net(tokens, segment_ids, valid_length)
+                p_mask = sample.masks.as_in_ctx(ctx) 
+                p_mask = 1 - p_mask  # In the network, we use 1 --> no_mask, 0 --> mask
+                answerable_logits = qa_net(tokens, segment_ids, valid_length,  p_mask)
                 for i, qas_id in enumerate(sample.qas_id):
                     result = RawResultExtended(qas_id=qas_id,
                                                answerable_logits=answerable_logits[i].asnumpy())

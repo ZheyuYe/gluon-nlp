@@ -394,7 +394,7 @@ def predict_extended(original_feature,
     nbest_json
         n-best predictions with their probabilities.
     """
-    not_answerable_score = 1000000  # Score for not-answerable. We set it to be a large and positive
+    score_null = 1000000  # Score for not-answerable. We set it to be a large and positive
     # If one chunk votes for answerable, we will treat the context as answerable,
     # Thus, the overall not_answerable_score = min(chunk_not_answerable_score)
     all_start_idx = []
@@ -426,9 +426,8 @@ def predict_extended(original_feature,
         for i in range(start_top_n):
             for j in range(end_top_n):
                 pred_score = float(result.start_top_logits[i] + result.end_top_logits[j])
-                # use the difference between answerable_logits and the sum of index logits
-                # as final answerable_score
-                not_answerable_score = min(not_answerable_score, - pred_score)
+                score_null = min(pred_score, score_null)
+
                 start_index = result.start_top_index[i]
                 end_index = result.end_top_index[j]
                 # We could hypothetically create invalid predictions, e.g., predict
@@ -448,6 +447,11 @@ def predict_extended(original_feature,
                 all_start_idx.append(start_idx)
                 all_end_idx.append(end_idx)
                 all_pred_score.append(pred_score)
+
+    all_start_idx.append(-1)
+    all_end_idx.append(-1)
+    all_pred_score.append(score_null)
+
     sorted_start_end_score = sorted(zip(all_start_idx, all_end_idx, all_pred_score),
                                     key=lambda args: args[-1], reverse=True)
     nbest = []
@@ -457,8 +461,11 @@ def predict_extended(original_feature,
     for start_idx, end_idx, pred_score in sorted_start_end_score:
         if len(seen_predictions) >= n_best_size:
             break
-        pred_answer = context_text[context_token_offsets[start_idx][0]:
-                                   context_token_offsets[end_idx][1]]
+        if start_idx >= 0 and end_idx >=0:
+            pred_answer = context_text[context_token_offsets[start_idx][0]:
+                                       context_token_offsets[end_idx][1]]
+        else:
+            pred_answer = ""
         seen_predictions.add(pred_answer)
         nbest.append((pred_answer, pred_score))
 
@@ -476,6 +483,7 @@ def predict_extended(original_feature,
         nbest_json.append(output)
 
     assert len(nbest_json) >= 1
+    not_answerable_score = score_null - float(nbest[0][1])
     return not_answerable_score, nbest[0][0], nbest_json
 
 
