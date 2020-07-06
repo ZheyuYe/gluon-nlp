@@ -41,7 +41,7 @@ class ModelForAnswerable(HybridBlock):
                                                    bias_initializer=bias_initializer,
                                                    prefix='out_'))
 
-    def hybrid_forward(self, F, tokens, token_types, valid_length, p_mask):
+    def hybrid_forward(self, F, tokens, token_types, valid_length, p_mask, a_mask):
         """
 
         Parameters
@@ -64,7 +64,7 @@ class ModelForAnswerable(HybridBlock):
             contextual_embedding = self.backbone(tokens, token_types, valid_length)
         else:
             contextual_embedding = self.backbone(tokens, valid_length)
-        mask = F.np.expand_dims(p_mask, 1) * F.np.expand_dims(F.np.ones_like(p_mask), -1)
+        mask = F.np.expand_dims(p_mask, 1) * F.np.expand_dims(a_mask, -1)
         data = F.npx.reshape(contextual_embedding, (-2, -2, self._num_heads, -1))
         context_representation, _ = self.answerable_attention(data, data, data, mask)
         # represents the revised attented hidden states of question and answers as

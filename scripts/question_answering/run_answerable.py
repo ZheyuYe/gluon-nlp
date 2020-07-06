@@ -234,16 +234,19 @@ class SquadDatasetProcessor:
             doc_stride=self._doc_stride,
             max_chunk_length=self._max_seq_length - len(truncated_query_ids) - 3)
         for chunk in chunks:
-            data = np.array([self.cls_id] + truncated_query_ids + [self.sep_id] +
+            data = np.array([self._tokenizer.vocab.cls_id] + truncated_query_ids +
+                            [self._tokenizer.vocab.sep_id] +
                             feature.context_token_ids[chunk.start:(chunk.start + chunk.length)] +
-                            [self.sep_id], dtype=np.int32)
+                            [self._tokenizer.vocab.sep_id], dtype=np.int32)
             valid_length = len(data)
             segment_ids = np.array([0] + [0] * len(truncated_query_ids) +
                                    [0] + [1] * chunk.length + [1], dtype=np.int32)
-            masks = np.array([0] + [1] * len(truncated_query_ids) + [1] + [0] * chunk.length + [1],
+            chunk_masks = [0] * chunk.length
+            masks = np.array([0] + [1] * len(truncated_query_ids) + [1] + chunk_masks + [1],
                              dtype=np.int32)
             context_offset = len(truncated_query_ids) + 2
             plau_chunk_masks = chunk_masks.copy()
+
             if chunk.start_pos is not None and chunk.end_pos is not None:
                 # Here, we increase the start and end because we put query before context
                 start_pos = chunk.start_pos + context_offset

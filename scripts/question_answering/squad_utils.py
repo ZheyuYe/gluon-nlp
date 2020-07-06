@@ -1,47 +1,28 @@
 """Utility classes and functions for data processing"""
-from typing import Optional, List
-from collections import namedtuple
-import itertools
-import re
-import numpy as np
-import numpy.ma as ma
-import warnings
 import os
-from tqdm import tqdm
+import re
 import json
+import time
 import string
+import logging
+import warnings
+import collections
+from typing import List, Optional
+from collections import namedtuple
+
+import mxnet as mx
+import numpy as np
+from tqdm import tqdm
+from mxnet.gluon import HybridBlock, nn
+from mxnet.gluon.utils import download
+
+from eval_utils import normalize_answer, make_qid_to_has_ans
 from gluonnlp.data.tokenizers import BaseTokenizerWithVocab
 from gluonnlp.utils.preprocessing import match_tokens_with_char_spans
-from typing import Tuple
-from mxnet.gluon.utils import download
 
 int_float_regex = re.compile('^\d+\.{0,1}\d*$')  # matches if a number is either integer or float
 
-import mxnet as mx
 mx.npx.set_np()
-
-
-def normalize_answer(s):
-    """Lower text and remove punctuation, articles and extra whitespace.
-    This is from the official evaluate-v2.0.py in SQuAD.
-    """
-
-    def remove_articles(text):
-        regex = re.compile(r'\b(a|an|the)\b', re.UNICODE)
-        return re.sub(regex, ' ', text)
-
-    def white_space_fix(text):
-        return ' '.join(text.split())
-
-    def remove_punc(text):
-        exclude = set(string.punctuation)
-        return ''.join(ch for ch in text if ch not in exclude)
-
-    def lower(text):
-        return text.lower()
-
-    return white_space_fix(remove_articles(remove_punc(lower(s))))
-
 
 def get_official_squad_eval_script(version='2.0', download_dir=None):
     url_info = {'2.0': ['evaluate-v2.0.py',
