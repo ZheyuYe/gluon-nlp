@@ -1,10 +1,82 @@
 import mxnet as mx
+from mxnet.gluon import nn, HybridBlock
 from mxnet.util import use_np
-from mxnet.gluon import HybridBlock, nn
-
-from gluonnlp.op import select_vectors_by_position
 from gluonnlp.layers import get_activation
-from gluonnlp.attention_cell import MultiHeadAttentionCell, masked_softmax, masked_logsoftmax
+from gluonnlp.op import select_vectors_by_position
+from gluonnlp.attention_cell import masked_logsoftmax, masked_softmax, MultiHeadAttentionCell
+
+@use_np
+class ModelForAnswerable(HybridBlock):
+    """A naive model model for Question Answering that only aim at the binary classification of
+    answerable questions.
+    """
+    def __init__(self, backbone, units=768, dropout_prob=0.1, activation='tanh',
+                 weight_initializer=None, bias_initializer=None,
+                 use_segmentation=True, prefix=None, params=None):
+        super().__init__(prefix=prefix, params=params)
+        self._num_heads = backbone.num_heads
+        self._dtype = backbone._dtype
+        with self.name_scope():
+            self.backbone = backbone
+            self.use_segmentation = use_segmentation
+            self.answerable_attention = MultiHeadAttentionCell(
+                query_units=units,
+                num_heads=self._num_heads,
+                attention_dropout=dropout_prob,
+                scaled=True,
+                dtype=self._dtype,
+                layout='NTK',
+                prefix='answerable_attention_',
+            )
+            self.answerable_scores = nn.HybridSequential(prefix='answerable_scores_')
+            with self.answerable_scores.name_scope():
+                self.answerable_scores.add(nn.Dense(units, flatten=False,
+                                                   weight_initializer=weight_initializer,
+                                                   bias_initializer=bias_initializer,
+                                                   prefix='mid_'))
+                self.answerable_scores.add(get_activation(activation))
+                self.answerable_scores.add(nn.Dropout(dropout_prob))
+                self.answerable_scores.add(nn.Dense(2, flatten=False,
+                                                   weight_initializer=weight_initializer,
+                                                   bias_initializer=bias_initializer,
+                                                   prefix='out_'))
+
+    def hybrid_forward(self, F, tokens, token_types, valid_length, p_mask):
+        """
+
+        Parameters
+        ----------
+        F
+        tokens
+            Shape (batch_size, sequence_length)
+        token_types
+            Shape (batch_size, sequence_length)
+        valid_length
+            Shape (batch_size,)
+        p_mask
+            Shape (batch_size, sequence_length)
+
+        Returns
+        -------
+        answerable_logits
+        """
+        if self.use_segmentation:
+            contextual_embedding = self.backbone(tokens, token_types, valid_length)
+        else:
+            contextual_embedding = self.backbone(tokens, valid_length)
+        mask = F.np.expand_dims(p_mask, 1) * F.np.expand_dims(F.np.ones_like(p_mask), -1)
+        data = F.npx.reshape(contextual_embedding, (-2, -2, self._num_heads, -1))
+        context_representation, _ = self.answerable_attention(data, data, data, mask)
+        # represents the revised attented hidden states of question and answers as
+        # CLS, Question, SEP, Context, SEP
+        # 1,   1,        0,   0,       0
+
+        # TODO(zheyuye), adding masking for context_representation if we choose advanced features
+        # instead of only [CLS] that used in answerable_scores raising a concern of independence.
+        cls_feature = context_representation[:, 0, :]
+        answerable_scores = self.answerable_scores(cls_feature)
+        answerable_logits = F.npx.log_softmax(answerable_scores, axis=-1, )
+        return answerable_logits
 
 
 @use_np
@@ -15,12 +87,12 @@ class ModelForQABasic(HybridBlock):
     another dense layer to map the contextual embeddings to the start scores and end scores.
 
     """
-
     def __init__(self, backbone, weight_initializer=None, bias_initializer=None,
-                 prefix=None, params=None):
+                 use_segmentation=True, prefix=None, params=None):
         super().__init__(prefix=prefix, params=params)
         with self.name_scope():
             self.backbone = backbone
+            self.use_segmentation = use_segmentation
             self.qa_outputs = nn.Dense(units=2, flatten=False,
                                        weight_initializer=weight_initializer,
                                        bias_initializer=bias_initializer,
@@ -55,13 +127,70 @@ class ModelForQABasic(HybridBlock):
             The log-softmax scores that the position is the end position.
         """
         # Get contextual embedding with the shape (batch_size, sequence_length, C)
-        contextual_embedding = self.backbone(tokens, token_types, valid_length)
+        if self.use_segmentation:
+            contextual_embedding = self.backbone(tokens, token_types, valid_length)
+        else:
+            contextual_embedding = self.backbone(tokens, valid_length)
         scores = self.qa_outputs(contextual_embedding)
         start_scores = scores[:, :, 0]
         end_scores = scores[:, :, 1]
         start_logits = masked_logsoftmax(F, start_scores, mask=p_mask, axis=-1)
         end_logits = masked_logsoftmax(F, end_scores, mask=p_mask, axis=-1)
         return start_logits, end_logits
+
+    def inference(self, tokens, token_types, valid_length, p_mask,
+                  start_top_n: int = 5, end_top_n: int = 5):
+        """Get the inference result with beam search
+
+        Parameters
+        ----------
+        tokens
+            The input tokens. Shape (batch_size, sequence_length)
+        token_types
+            The input token types. Shape (batch_size, sequence_length)
+        valid_length
+            The valid length of the tokens. Shape (batch_size,)
+        p_mask
+            The mask which indicates that some tokens won't be used in the calculation.
+            Shape (batch_size, sequence_length)
+        start_top_n
+            The number of candidates to select for the start position.
+        end_top_n
+            The number of candidates to select for the end position.
+
+        Returns
+        -------
+        start_top_logits
+            The top start logits
+            Shape (batch_size, start_top_n)
+        start_top_index
+            Index of the top start logits
+            Shape (batch_size, start_top_n)
+        end_top_logits
+            The top end logits.
+            Shape (batch_size, end_top_n)
+        end_top_index
+            Index of the top end logits
+            Shape (batch_size, end_top_n)
+        """
+        # Shape (batch_size, sequence_length, C)
+        if self.use_segmentation:
+            contextual_embedding = self.backbone(tokens, token_types, valid_length)
+        else:
+            contextual_embedding = self.backbone(tokens, valid_length)
+        scores = self.qa_outputs(contextual_embedding)
+        start_scores = scores[:, :, 0]
+        end_scores = scores[:, :, 1]
+        start_logits = masked_logsoftmax(mx.nd, start_scores, mask=p_mask, axis=-1)
+        end_logits = masked_logsoftmax(mx.nd, end_scores, mask=p_mask, axis=-1)
+        # The shape of start_top_index will be (..., start_top_n)
+        start_top_logits, start_top_index = mx.npx.topk(start_logits, k=start_top_n, axis=-1,
+                                                        ret_typ='both')
+        # Note that end_top_index and end_top_log_probs have shape (bsz, start_n_top, end_n_top)
+        # So that for each start position, there are end_n_top end positions on the third dim.
+        end_top_logits, end_top_index = mx.npx.topk(end_logits, k=end_top_n, axis=-1,
+                                                    ret_typ='both')
+        return start_top_logits, start_top_index, end_top_logits, end_top_index
 
 
 @use_np
@@ -78,15 +207,13 @@ class ModelForQAConditionalV1(HybridBlock):
     In the inference phase, we are able to use beam search to do the inference.
 
     """
-
     def __init__(self, backbone, units=768, layer_norm_eps=1E-12, dropout_prob=0.1,
                  activation='tanh', weight_initializer=None, bias_initializer=None,
-                 prefix=None, params=None):
+                 use_segmentation=True, prefix=None, params=None):
         super().__init__(prefix=prefix, params=params)
-        self._num_heads = backbone.num_heads
-        self._dtype = backbone._dtype
         with self.name_scope():
             self.backbone = backbone
+            self.use_segmentation = use_segmentation
             self.start_scores = nn.Dense(1, flatten=False,
                                          weight_initializer=weight_initializer,
                                          bias_initializer=bias_initializer,
@@ -115,29 +242,6 @@ class ModelForQAConditionalV1(HybridBlock):
                                                     weight_initializer=weight_initializer,
                                                     bias_initializer=bias_initializer,
                                                     prefix='out_'))
-
-            self.plausible_attention = MultiHeadAttentionCell(
-                query_units=units,
-                num_heads=self._num_heads,
-                attention_dropout=dropout_prob,
-                scaled=True,
-                dtype=self._dtype,
-                layout='NTK',
-                prefix='plausible_attention_',
-
-            )
-            self.plausible_scores = nn.HybridSequential(prefix='plausible_scores_')
-            with self.plausible_scores.name_scope():
-                self.plausible_scores.add(nn.Dense(units, flatten=False,
-                                                   weight_initializer=weight_initializer,
-                                                   bias_initializer=bias_initializer,
-                                                   prefix='mid_'))
-                self.plausible_scores.add(get_activation(activation))
-                self.plausible_scores.add(nn.Dropout(dropout_prob))
-                self.plausible_scores.add(nn.Dense(2, flatten=False,
-                                                   weight_initializer=weight_initializer,
-                                                   bias_initializer=bias_initializer,
-                                                   prefix='out_'))
 
     def get_start_logits(self, F, contextual_embedding, p_mask):
         """
@@ -224,52 +328,7 @@ class ModelForQAConditionalV1(HybridBlock):
         answerable_logits = F.npx.log_softmax(answerable_scores, axis=-1)
         return answerable_logits
 
-    def get_plausible_logits(self, F, contextual_embedding, p_mask, a_mask):
-        mask = F.np.expand_dims(p_mask, 1) * F.np.expand_dims(a_mask, -1)
-        data = F.npx.reshape(contextual_embedding, (-2, -2, self._num_heads, -1))
-        context_representation, _ = self.plausible_attention(data, data, data, mask)
-        # represents the revised attented hidden states of question and answers as
-        # CLS, Question, SEP, Context, SEP
-        # 1,   1,        0,   0,       0
-
-        # TODO(zheyuye), adding masking for context_representation if we choose advanced features
-        # instead of only [CLS] that used in answerable_scores raising a concern of independence.
-        cls_feature = context_representation[:, 0, :]
-        plausible_scores = self.plausible_scores(cls_feature)
-        plausible_logits = F.npx.log_softmax(plausible_scores, axis=-1)
-        return plausible_logits
-
-    def pos_cls_verification(self, F, start_logits, contextual_embedding, p_mask):
-        """
-        Verify the answerability
-
-        Parameters
-        ----------
-        F
-        start_logits
-            Shape (batch_size, sequence_length)
-        contextual_embedding
-            Shape (batch_size, sequence_length, C)
-        p_mask
-            Shape (batch_size, sequence_length)
-            Mask the sequence.
-            0 --> Denote that the element is masked,
-            1 --> Denote that the element is not masked
-        Returns
-        -------
-        pos_cls_logits
-            Shape (batch_size, )
-        """
-        # As for the verifier,
-        # get the probability of the first token of end_logits when srart index is 0
-        start_cls_logits = start_logits[:, 0]
-        zero_index = F.np.zeros_like(start_logits[:, 0:1])
-        end_cls_logits = self.get_end_logits(F, contextual_embedding, zero_index, p_mask)
-        end_cls_logits = F.np.squeeze(end_cls_logits, axis=1)[:, 0]  # Shape (batch_size, )
-        pos_cls_logits = start_cls_logits + end_cls_logits
-        return pos_cls_logits
-
-    def hybrid_forward(self, F, tokens, token_types, valid_length, p_mask, start_position, a_mask):
+    def hybrid_forward(self, F, tokens, token_types, valid_length, p_mask, start_position):
         """
 
         Parameters
@@ -285,8 +344,7 @@ class ModelForQAConditionalV1(HybridBlock):
             Shape (batch_size, sequence_length)
         start_position
             Shape (batch_size,)
-        a_mask
-            Shape (batch_size, sequence_length)
+
         Returns
         -------
         start_logits
@@ -295,17 +353,20 @@ class ModelForQAConditionalV1(HybridBlock):
             Shape (batch_size, sequence_length)
         answerable_logits
         """
-        contextual_embeddings = self.backbone(tokens, token_types, valid_length)
-        start_logits = self.get_start_logits(F, contextual_embeddings, p_mask)
-        end_logits = self.get_end_logits(F, contextual_embeddings,
+        if self.use_segmentation:
+            contextual_embedding = self.backbone(tokens, token_types, valid_length)
+        else:
+            contextual_embedding = self.backbone(tokens, valid_length)
+
+        start_logits = self.get_start_logits(F, contextual_embedding, p_mask)
+        end_logits = self.get_end_logits(F, contextual_embedding,
                                          F.np.expand_dims(start_position, axis=1),
                                          p_mask)
         end_logits = F.np.squeeze(end_logits, axis=1)
-        answerable_logits = self.get_answerable_logits(F, contextual_embeddings, p_mask)
-        plausible_logits = self.get_plausible_logits(F, contextual_embeddings, p_mask, a_mask)
-        return start_logits, end_logits, answerable_logits, plausible_logits
+        answerable_logits = self.get_answerable_logits(F, contextual_embedding, p_mask)
+        return start_logits, end_logits, answerable_logits
 
-    def inference(self, tokens, token_types, valid_length, p_mask, a_mask,
+    def inference(self, tokens, token_types, valid_length, p_mask,
                   start_top_n: int = 5, end_top_n: int = 5):
         """Get the inference result with beam search
 
@@ -344,19 +405,19 @@ class ModelForQAConditionalV1(HybridBlock):
             Shape (batch_size, sequence_length, 2)
         """
         # Shape (batch_size, sequence_length, C)
-        contextual_embeddings = self.backbone(tokens, token_types, valid_length)
-        start_logits = self.get_start_logits(mx.nd, contextual_embeddings, p_mask)
+        if self.use_segmentation:
+            contextual_embedding = self.backbone(tokens, token_types, valid_length)
+        else:
+            contextual_embedding = self.backbone(tokens, valid_length)
+        start_logits = self.get_start_logits(mx.nd, contextual_embedding, p_mask)
         # The shape of start_top_index will be (..., start_top_n)
         start_top_logits, start_top_index = mx.npx.topk(start_logits, k=start_top_n, axis=-1,
                                                         ret_typ='both')
-        end_logits = self.get_end_logits(mx.nd, contextual_embeddings, start_top_index, p_mask)
+        end_logits = self.get_end_logits(mx.nd, contextual_embedding, start_top_index, p_mask)
         # Note that end_top_index and end_top_log_probs have shape (bsz, start_n_top, end_n_top)
         # So that for each start position, there are end_n_top end positions on the third dim.
         end_top_logits, end_top_index = mx.npx.topk(end_logits, k=end_top_n, axis=-1,
                                                     ret_typ='both')
-        answerable_logits = self.get_answerable_logits(mx.nd, contextual_embeddings, p_mask)
-        plausible_logits = self.get_plausible_logits(mx.nd, contextual_embeddings, p_mask, a_mask)
-        pos_cls_logits = self.pos_cls_verification(
-            mx.nd, start_logits, contextual_embeddings, p_mask)
+        answerable_logits = self.get_answerable_logits(mx.nd, contextual_embedding, p_mask)
         return start_top_logits, start_top_index, end_top_logits, end_top_index, \
-            answerable_logits, plausible_logits, pos_cls_logits
+                    answerable_logits

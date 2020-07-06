@@ -17,8 +17,8 @@ import numpy as np
 from mxnet.lr_scheduler import PolyScheduler
 
 import gluonnlp.data.batchify as bf
-from models import ModelForQAConditionalV1
-from eval_utils import squad_eval
+from models import ModelForAnswerable
+from eval_utils import squad_eval, answerable_eval
 from squad_utils import SquadFeature, get_squad_examples, convert_squad_example_to_feature
 from gluonnlp.models import get_backbone
 from gluonnlp.utils.misc import grouper, repeat, set_seed, parse_ctx, logging_config, count_parameters
@@ -342,11 +342,11 @@ def get_network(model_name,
         logging.info(
             'Loading Backbone Model from {}, with total/fixd parameters={}/{}'.format(
                 backbone_params_path, num_params, num_fixed_params))
-    qa_net = ModelForQAConditionalV1(backbone=backbone,
-                                     dropout_prob=dropout,
-                                     weight_initializer=TruncNorm(stdev=0.02),
-                                     use_segmentation=use_segmentation,
-                                     prefix='qa_net_')
+    qa_net = ModelForAnswerable(backbone=backbone,
+                                dropout_prob=dropout,
+                                weight_initializer=TruncNorm(stdev=0.02),
+                                use_segmentation=use_segmentation,
+                                prefix='qa_net_')
     if checkpoint_path is None:
         # Ignore the UserWarning during initialization,
         # There is no need to re-initialize the parameters of backbone
@@ -510,8 +510,6 @@ def train(args):
     num_samples_per_update = 0
     loss_denom = float(len(ctx_l) * args.num_accumulated)
 
-    log_span_loss = 0
-    log_answerable_loss = 0
     log_total_loss = 0
     log_sample_num = 0
     if args.num_accumulated != 1:
@@ -525,8 +523,6 @@ def train(args):
             grouper(repeat(train_dataloader), len(ctx_l) * args.num_accumulated)):
         for sample_l in grouper(batch_data, len(ctx_l)):
             loss_l = []
-            span_loss_l = []
-            answerable_loss_l = []
             for sample, ctx in zip(sample_l, ctx_l):
                 if sample is None:
                     continue
@@ -537,32 +533,21 @@ def train(args):
                 segment_ids = sample.segment_ids.as_in_ctx(ctx) if use_segmentation else None
                 valid_length = sample.valid_length.as_in_ctx(ctx)
                 p_mask = sample.masks.as_in_ctx(ctx)
-                gt_start = sample.gt_start.as_in_ctx(ctx)
-                gt_end = sample.gt_end.as_in_ctx(ctx)
                 is_impossible = sample.is_impossible.as_in_ctx(ctx).astype(np.int32)
                 batch_idx = mx.np.arange(tokens.shape[0], dtype=np.int32, ctx=ctx)
                 p_mask = 1 - p_mask  # In the network, we use 1 --> no_mask, 0 --> mask
                 with mx.autograd.record():
-                    start_logits, end_logits, answerable_logits \
-                        = qa_net(tokens, segment_ids, valid_length, p_mask, gt_start)
-                    sel_start_logits = start_logits[batch_idx, gt_start]
-                    sel_end_logits = end_logits[batch_idx, gt_end]
+                    answerable_logits = qa_net(tokens, segment_ids, valid_length, p_mask)
                     sel_answerable_logits = answerable_logits[batch_idx, is_impossible]
-                    span_loss = - 0.5 * (sel_start_logits + sel_end_logits).sum()
                     answerable_loss = - 0.5 * sel_answerable_logits.sum()
-                    loss = (span_loss + answerable_loss) / loss_denom
+                    loss = answerable_loss / loss_denom
                     loss_l.append(loss)
-                    span_loss_l.append(span_loss)
-                    answerable_loss_l.append(answerable_loss)
 
             for loss in loss_l:
                 loss.backward()
             # All Reduce the Step Loss
-            log_span_loss += sum([ele.as_in_ctx(ctx_l[0]) for ele in span_loss_l]).asnumpy()
             log_total_loss += sum([ele.as_in_ctx(ctx_l[0])
                                    for ele in loss_l]).asnumpy() * loss_denom
-            log_answerable_loss += sum([ele.as_in_ctx(ctx_l[0])
-                                        for ele in answerable_loss_l]).asnumpy()
         # update
         trainer.allreduce_grads()
         # Here, the accumulated gradients are
@@ -599,20 +584,15 @@ def train(args):
 
         # logging
         if (step_num + 1) % log_interval == 0:
-            log_span_loss /= log_sample_num
-            log_answerable_loss /= log_sample_num
             log_total_loss /= log_sample_num
             toc = time.time()
             logging.info(
-                'Step: {}/{}, Loss span/answer/total={:.4f}/{:.4f}/{:.4f},'
+                'Step: {}/{}, Loss total={:.4f},'
                 ' LR={:.8f}, grad_norm={:.4f}. Time cost={:.2f}, Throughput={:.2f} samples/s'
-                ' ETA={:.2f}h'.format((step_num + 1), num_train_steps, log_span_loss,
-                                      log_answerable_loss, log_total_loss, trainer.learning_rate, total_norm,
+                ' ETA={:.2f}h'.format((step_num + 1), num_train_steps, log_total_loss, trainer.learning_rate, total_norm,
                                       toc - tic, log_sample_num / (toc - tic),
                                       (num_train_steps - (step_num + 1)) / ((step_num + 1) / (toc - global_tic)) / 3600))
             tic = time.time()
-            log_span_loss = 0
-            log_answerable_loss = 0
             log_total_loss = 0
             log_sample_num = 0
             num_samples_per_update = 0
@@ -627,10 +607,6 @@ def train(args):
 RawResultExtended = collections.namedtuple(
     'RawResultExtended',
     ['qas_id',
-     'start_top_logits',
-     'start_top_index',
-     'end_top_logits',
-     'end_top_index',
      'answerable_logits'])
 
 
@@ -674,84 +650,12 @@ def predict_extended(original_feature,
     not_answerable_score = 1000000  # Score for not-answerable. We set it to be a large and positive
     # If one chunk votes for answerable, we will treat the context as answerable,
     # Thus, the overall not_answerable_score = min(chunk_not_answerable_score)
-    all_start_idx = []
-    all_end_idx = []
-    all_pred_score = []
-    context_length = len(original_feature.context_token_ids)
-    token_max_context_score = np.full((len(chunked_features), context_length),
-                                      -np.inf,
-                                      dtype=np.float32)
-    for i, chunked_feature in enumerate(chunked_features):
-        chunk_start = chunked_feature.chunk_start
-        chunk_length = chunked_feature.chunk_length
-        for j in range(chunk_start, chunk_start + chunk_length):
-            # This is a heuristic score
-            # TODO investigate the impact
-            token_max_context_score[i, j] = min(j - chunk_start,
-                                                chunk_start + chunk_length - 1 - j) \
-                + 0.01 * chunk_length
-    token_max_chunk_id = token_max_context_score.argmax(axis=0)
-
     for chunk_id, (result, chunk_feature) in enumerate(zip(results, chunked_features)):
         # We use the log-likelihood as the not answerable score.
         # Thus, a high score indicates that the answer is not answerable
         cur_not_answerable_score = float(result.answerable_logits[1])
         not_answerable_score = min(not_answerable_score, cur_not_answerable_score)
-        # Calculate the start_logits + end_logits as the overall score
-        context_offset = chunk_feature.context_offset
-        chunk_start = chunk_feature.chunk_start
-        chunk_length = chunk_feature.chunk_length
-        for i in range(start_top_n):
-            for j in range(end_top_n):
-                pred_score = result.start_top_logits[i] + result.end_top_logits[i, j]
-                start_index = result.start_top_index[i]
-                end_index = result.end_top_index[i, j]
-                # We could hypothetically create invalid predictions, e.g. predict
-                # that the start of the answer span is in the query tokens or out of
-                # the chunk. We throw out all invalid predictions.
-                if not (context_offset <= start_index < context_offset + chunk_length) or \
-                   not (context_offset <= end_index < context_offset + chunk_length) or \
-                   end_index < start_index:
-                    continue
-                pred_answer_length = end_index - start_index + 1
-                if pred_answer_length > max_answer_length:
-                    continue
-                start_idx = int(start_index - context_offset + chunk_start)
-                end_idx = int(end_index - context_offset + chunk_start)
-                if token_max_chunk_id[start_idx] != chunk_id:
-                    continue
-                all_start_idx.append(start_idx)
-                all_end_idx.append(end_idx)
-                all_pred_score.append(pred_score)
-    sorted_start_end_score = sorted(zip(all_start_idx, all_end_idx, all_pred_score),
-                                    key=lambda args: args[-1], reverse=True)
-    nbest = []
-    context_text = original_feature.context_text
-    context_token_offsets = original_feature.context_token_offsets
-    seen_predictions = set()
-    for start_idx, end_idx, pred_score in sorted_start_end_score:
-        if len(seen_predictions) >= n_best_size:
-            break
-        pred_answer = context_text[context_token_offsets[start_idx][0]:
-                                   context_token_offsets[end_idx][1]]
-        seen_predictions.add(pred_answer)
-        nbest.append((pred_answer, pred_score))
-
-    # In very rare edge cases we could have no valid predictions. So we
-    # just create a nonce prediction in this case to avoid failure.
-    if len(nbest) == 0:
-        nbest.append(('', float('-inf')))
-    all_scores = np.array([ele[1] for ele in nbest], dtype=np.float32)
-    probs = np.exp(all_scores) / np.sum(np.exp(all_scores))
-    nbest_json = []
-    for i, (entry, prob) in enumerate(zip(nbest, probs)):
-        output = collections.OrderedDict()
-        output['text'] = entry[0]
-        output['probability'] = float(prob)
-        nbest_json.append(output)
-
-    assert len(nbest_json) >= 1
-    return not_answerable_score, nbest[0][0], nbest_json
+    return not_answerable_score
 
 
 def evaluate(args, last=True):
@@ -826,15 +730,9 @@ def evaluate(args, last=True):
                 valid_length = sample.valid_length.as_in_ctx(ctx)
                 p_mask = sample.masks.as_in_ctx(ctx)
                 p_mask = 1 - p_mask  # In the network, we use 1 --> no_mask, 0 --> mask
-                start_top_logits, start_top_index, end_top_logits, end_top_index, answerable_logits \
-                    = qa_net.inference(tokens, segment_ids, valid_length, p_mask,
-                                       args.start_top_n, args.end_top_n)
+                answerable_logits = qa_net(tokens, segment_ids, valid_length,  p_mask)
                 for i, qas_id in enumerate(sample.qas_id):
                     result = RawResultExtended(qas_id=qas_id,
-                                               start_top_logits=start_top_logits[i].asnumpy(),
-                                               start_top_index=start_top_index[i].asnumpy(),
-                                               end_top_logits=end_top_logits[i].asnumpy(),
-                                               end_top_index=end_top_index[i].asnumpy(),
                                                answerable_logits=answerable_logits[i].asnumpy())
 
                     all_results.append(result)
@@ -855,8 +753,6 @@ def evaluate(args, last=True):
         logging.info('Time cost=%2f s, Thoughput=%.2f samples/s', epoch_toc - epoch_tic,
                      total_num / (epoch_toc - epoch_tic))
 
-        all_predictions = collections.OrderedDict()
-        all_nbest_json = collections.OrderedDict()
         no_answer_score_json = collections.OrderedDict()
         for index, (left_index, right_index) in enumerate(zip(dev_chunk_feature_ptr[:-1],
                                                               dev_chunk_feature_ptr[1:])):
@@ -869,7 +765,7 @@ def evaluate(args, last=True):
             example_qas_id = list(qas_ids)[0]
             assert example_qas_id == original_feature.qas_id, \
                 'Mismatch Occured between original feature and chunked features'
-            not_answerable_score, best_pred, nbest_json = predict_extended(
+            not_answerable_score = predict_extended(
                 original_feature=original_feature,
                 chunked_features=chunked_features,
                 results=results,
@@ -878,43 +774,22 @@ def evaluate(args, last=True):
                 start_top_n=args.start_top_n,
                 end_top_n=args.end_top_n)
             no_answer_score_json[example_qas_id] = not_answerable_score
-            all_predictions[example_qas_id] = best_pred
-            all_nbest_json[example_qas_id] = nbest_json
 
-        if args.version == '2.0':
-            exact = 'best_exact'
-            f1 = 'best_f1'
-            na_prob = no_answer_score_json
-        else:
-            exact = 'exact'
-            f1 = 'f1'
-            na_prob = None
-
-        cur_eval, revised_predictions = squad_eval(
-            dev_data_path, all_predictions, na_prob, revise=na_prob is not None)
+        cur_eval = answerable_eval(dev_data_path, no_answer_score_json)
         logging.info('The evaluated results are {}'.format(json.dumps(cur_eval)))
 
-        cur_metrics = 0.5 * (cur_eval[exact] + cur_eval[f1])
+        cur_metrics = cur_eval['accuracy']
         if best_eval:
-            best_metrics = 0.5 * (best_eval[exact] + best_eval[f1])
+            best_metrics = best_eval['accuracy']
         else:
             best_metrics = 0.
 
         if cur_metrics > best_metrics:
             logging.info('The evaluated files are saved in {}'.format(args.output_dir))
-            output_prediction_file = os.path.join(args.output_dir, 'predictions.json')
-            output_nbest_file = os.path.join(args.output_dir, 'nbest_predictions.json')
             na_prob_file = os.path.join(args.output_dir, 'na_prob.json')
-            revised_prediction_file = os.path.join(args.output_dir, 'revised_predictions.json')
 
-            with open(output_prediction_file, 'w') as of:
-                of.write(json.dumps(all_predictions, indent=4) + '\n')
-            with open(output_nbest_file, 'w') as of:
-                of.write(json.dumps(all_nbest_json, indent=4) + '\n')
             with open(na_prob_file, 'w') as of:
                 of.write(json.dumps(no_answer_score_json, indent=4) + '\n')
-            with open(revised_prediction_file, 'w') as of:
-                of.write(json.dumps(revised_predictions, indent=4) + '\n')
 
             best_eval = cur_eval
             best_eval.update({'best_ckpt': ckpt_name})

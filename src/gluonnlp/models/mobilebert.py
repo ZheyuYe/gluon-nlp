@@ -211,13 +211,11 @@ class MobileBertEncoderLayer(HybridBlock):
                     is_last_ffn = (ffn_idx == (num_stacked_ffn - 1))
                     # only apply dropout on last ffn layer if use bottleneck
                     dropout = float(hidden_dropout_prob * (not use_bottleneck) * is_last_ffn)
-                    activation_dropout = float(activation_dropout_prob * (not use_bottleneck)
-                                               * is_last_ffn)
                     self.stacked_ffn.add(
                         PositionwiseFFN(units=real_units,
                                         hidden_size=hidden_size,
                                         dropout=dropout,
-                                        activation_dropout=activation_dropout,
+                                        activation_dropout=activation_dropout_prob,
                                         weight_initializer=weight_initializer,
                                         bias_initializer=bias_initializer,
                                         activation=activation,
@@ -432,6 +430,7 @@ class MobileBertModel(HybridBlock):
                  params=None):
         super().__init__(prefix=prefix, params=params)
         self._dtype = dtype
+        self.num_heads = num_heads
         self.use_bottleneck = use_bottleneck
         self.bottleneck_strategy = bottleneck_strategy
         self.trigram_embed = trigram_embed
@@ -542,7 +541,7 @@ class MobileBertModel(HybridBlock):
         pooled_output :
             This is optional. Shape (batch_size, units)
         """
-        embedding = self.get_initial_embedding(F, inputs, token_types)
+        embedding = self.get_initial_embedding(F, inputs, token_types, self.trigram_embed)
 
         contextual_embeddings, additional_outputs = self.encoder(embedding, valid_length)
         outputs = []
@@ -963,8 +962,6 @@ def get_pretrained_mobilebert(model_name: str = 'google_uncased_mobilebert',
                                          sha1_hash=FILE_STATS[mlm_params_path])
     else:
         local_mlm_params_path = None
-    do_lower = True if 'lowercase' in PRETRAINED_URL[model_name]\
-                       and PRETRAINED_URL[model_name]['lowercase'] else False
     # TODO(sxjscience) Move do_lower to assets.
     tokenizer = HuggingFaceWordPieceTokenizer(
                     vocab_file=local_paths['vocab'],
@@ -973,7 +970,7 @@ def get_pretrained_mobilebert(model_name: str = 'google_uncased_mobilebert',
                     cls_token='[CLS]',
                     sep_token='[SEP]',
                     mask_token='[MASK]',
-                    lowercase=do_lower)
+                    lowercase=True)
     cfg = MobileBertModel.get_cfg().clone_merge(local_paths['cfg'])
     return cfg, tokenizer, local_params_path, local_mlm_params_path
 

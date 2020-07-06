@@ -1,5 +1,5 @@
 """
-Question Answering with Pretrained Language Model
+Question Answering with Pretrained Language Model using ModelForQABasic
 """
 # pylint:disable=redefined-outer-name,logging-format-interpolation
 
@@ -17,282 +17,20 @@ import numpy as np
 from mxnet.lr_scheduler import PolyScheduler
 
 import gluonnlp.data.batchify as bf
-from models import ModelForQAConditionalV1
+from models import ModelForQABasic
 from eval_utils import squad_eval
 from squad_utils import SquadFeature, get_squad_examples, convert_squad_example_to_feature
 from gluonnlp.models import get_backbone
 from gluonnlp.utils.misc import grouper, repeat, set_seed, parse_ctx, logging_config, count_parameters
 from gluonnlp.initializer import TruncNorm
 from gluonnlp.utils.parameter import clip_grad_global_norm
+from run_squad import SquadDatasetProcessor, parse_args
 
 mx.npx.set_np()
 
 CACHE_PATH = os.path.realpath(os.path.join(os.path.realpath(__file__), '..', 'cached'))
 if not os.path.exists(CACHE_PATH):
     os.makedirs(CACHE_PATH, exist_ok=True)
-
-
-def parse_args():
-    parser = argparse.ArgumentParser(
-        description='Question Answering example. '
-                    'We fine-tune the pretrained model on SQuAD dataset.')
-    parser.add_argument('--model_name', type=str, default='google_albert_base_v2',
-                        help='Name of the pretrained model.')
-    parser.add_argument('--do_train', action='store_true',
-                        help='Whether to train the model')
-    parser.add_argument('--do_eval', action='store_true',
-                        help='Whether to evaluate the model')
-    parser.add_argument('--data_dir', type=str, default='squad')
-    parser.add_argument('--version', default='2.0', choices=['1.1', '2.0'],
-                        help='Version of the SQuAD dataset.')
-    parser.add_argument('--output_dir', type=str, default='squad_out',
-                        help='The output directory where the model params will be written.'
-                             ' default is squad_out')
-    parser.add_argument('--gpus', type=str, default='0',
-                        help='list of gpus to run, e.g. 0 or 0,2,5. -1 means using cpu.')
-    # Training hyperparameters
-    parser.add_argument('--seed', type=int, default=100, help='Random seed')
-    parser.add_argument('--log_interval', type=int, default=100, help='The logging interval.')
-    parser.add_argument('--save_interval', type=int, default=None,
-                        help='the number of steps to save model parameters.'
-                             'default is every epoch')
-    parser.add_argument('--epochs', type=float, default=3.0,
-                        help='Number of epochs, default is 3')
-    parser.add_argument('--num_train_steps', type=int, default=None,
-                        help='The number of training steps. Note that epochs will be ignored '
-                             'if training steps are set')
-    parser.add_argument('--batch_size', type=int, default=8,
-                        help='Batch size. Number of examples per gpu in a minibatch. default is 32')
-    parser.add_argument('--eval_batch_size', type=int, default=16,
-                        help='Evaluate batch size. Number of examples per gpu in a minibatch for '
-                             'evaluation.')
-    parser.add_argument('--max_grad_norm', type=float, default=1.0,
-                        help='Max gradient norm.')
-    parser.add_argument('--optimizer', type=str, default='adamw',
-                        help='optimization algorithm. default is adamw')
-    parser.add_argument('--adam_epsilon', type=float, default=1e-6,
-                        help='epsilon of AdamW optimizer')
-    parser.add_argument('--adam_betas', default='(0.9, 0.999)', metavar='B',
-                        help='betas for Adam optimizer')
-    parser.add_argument('--num_accumulated', type=int, default=1,
-                        help='The number of batches for gradients accumulation to '
-                             'simulate large batch size.')
-    parser.add_argument('--lr', type=float, default=2e-5,
-                        help='Initial learning rate. default is 2e-5')
-    parser.add_argument('--warmup_ratio', type=float, default=0.1,
-                        help='Ratio of warmup steps in the learning rate scheduler.')
-    parser.add_argument('--warmup_steps', type=int, default=None,
-                        help='warmup steps. Note that either warmup_steps or warmup_ratio is set.')
-    parser.add_argument('--wd', type=float, default=0.01, help='weight decay')
-    parser.add_argument('--layerwise_decay', type=float, default=-1, help='Layer-wise lr decay')
-    parser.add_argument('--untunable_depth', type=float, default=-1,
-                        help='Depth of untunable parameters')
-    parser.add_argument('--classifier_dropout', type=float, default=0.1,
-                        help='dropout of classifier')
-    # Data pre/post processing
-    parser.add_argument('--max_seq_length', type=int, default=512,
-                        help='The maximum total input sequence length after tokenization.'
-                             'Sequences longer than this will be truncated, and sequences shorter '
-                             'than this will be padded. default is 512')
-    parser.add_argument('--doc_stride', type=int, default=128,
-                        help='When splitting up a long document into chunks, how much stride to '
-                             'take between chunks. default is 128')
-    parser.add_argument('--max_query_length', type=int, default=64,
-                        help='The maximum number of tokens for the query. Questions longer than '
-                             'this will be truncated to this length. default is 64')
-    parser.add_argument('--round_to', type=int, default=None,
-                        help='The length of padded sequences will be rounded up to be multiple'
-                             ' of this argument. When round to is set to 8, training throughput '
-                             'may increase for mixed precision training on GPUs with TensorCores.')
-    parser.add_argument('--overwrite_cache', action='store_true',
-                        help='Whether to overwrite the feature cache.')
-    # Evaluation hyperparameters
-    parser.add_argument('--start_top_n', type=int, default=5,
-                        help='Number of start-position candidates')
-    parser.add_argument('--end_top_n', type=int, default=5,
-                        help='Number of end-position candidates corresponding '
-                             'to a start position')
-    parser.add_argument('--n_best_size', type=int, default=20, help='Top N results written to file')
-    parser.add_argument('--max_answer_length', type=int, default=30,
-                        help='The maximum length of an answer that can be generated. This is '
-                             'needed because the start and end predictions are not conditioned '
-                             'on one another. default is 30')
-    parser.add_argument('--param_checkpoint', type=str, default=None,
-                        help='The parameter checkpoint for evaluating the model')
-    parser.add_argument('--backbone_path', type=str, default=None,
-                        help='The parameter checkpoint of backbone model')
-    parser.add_argument('--all_evaluate', action='store_true',
-                        help='Whether to evaluate all intermediate checkpoints '
-                             'instead of only last one')
-    parser.add_argument('--max_saved_ckpt', type=int, default=10,
-                        help='The maximum number of saved checkpoints')
-    args = parser.parse_args()
-    return args
-
-
-class SquadDatasetProcessor:
-
-    def __init__(self, tokenizer, doc_stride, max_seq_length, max_query_length):
-        """
-
-        Parameters
-        ----------
-        tokenizer
-            The tokenizer
-        doc_stride
-            The stride to chunk the document
-        max_seq_length
-            Maximum length of the merged data
-        max_query_length
-            Maximum query length
-        """
-        self._tokenizer = tokenizer
-        self._doc_stride = doc_stride
-        self._max_seq_length = max_seq_length
-        self._max_query_length = max_query_length
-
-        vocab = tokenizer.vocab
-        self.pad_id = vocab.pad_id
-        # For roberta model, taking sepecial token <s> as [CLS] and </s> as [SEP]
-        self.cls_id = vocab.bos_id if 'cls_token' not in vocab.special_token_keys else vocab.cls_id
-        self.sep_id = vocab.eos_id if 'sep_token' not in vocab.special_token_keys else vocab.sep_id
-
-        # TODO(sxjscience) Consider to combine the NamedTuple and batchify functionality.
-        self.ChunkFeature = collections.namedtuple('ChunkFeature',
-                                                   ['qas_id',
-                                                    'data',
-                                                    'valid_length',
-                                                    'segment_ids',
-                                                    'masks',
-                                                    'is_impossible',
-                                                    'gt_start',
-                                                    'gt_end',
-                                                    'context_offset',
-                                                    'chunk_start',
-                                                    'chunk_length'])
-        self.BatchifyFunction = bf.NamedTuple(self.ChunkFeature,
-                                              {'qas_id': bf.List(),
-                                               'data': bf.Pad(val=self.pad_id),
-                                               'valid_length': bf.Stack(),
-                                               'segment_ids': bf.Pad(),
-                                               'masks': bf.Pad(val=1),
-                                               'is_impossible': bf.Stack(),
-                                               'gt_start': bf.Stack(),
-                                               'gt_end': bf.Stack(),
-                                               'context_offset': bf.Stack(),
-                                               'chunk_start': bf.Stack(),
-                                               'chunk_length': bf.Stack()})
-
-    def process_sample(self, feature: SquadFeature):
-        """Process the data to the following format.
-
-        Note that we mask all the special tokens except the CLS token. The reason for not masking
-        the CLS token is that if the question is not answerable, we will set the start and end to
-        be 0.
-
-
-        Merged:      <CLS> Question <SEP> Context <SEP>
-        Segment IDs:  0       0       0      1      1
-        Mask:         0       1       1      0      1
-
-        Here, we need to emphasize that when mask = 1, the data are actually not masked!
-
-        Parameters
-        ----------
-        feature
-            Tokenized SQuAD feature
-
-        Returns
-        -------
-        ret
-            Divide the feature into multiple chunks and extract the feature which contains
-            the following:
-            - data
-                The data that concatenates the query and the context + special tokens
-            - valid_length
-                The valid_length of the data
-            - segment_ids
-                We assign the query part as segment 0 and the context part as segment 1.
-            - masks
-                We mask all the special tokens. 1 --> not masked, 0 --> masked.
-            - is_impossible
-                Whether the provided context is impossible to answer or not.
-            - gt_start
-                The ground-truth start location of the span
-            - gt_end
-                The ground-truth end location of the span
-            - chunk_start
-                The start of the chunk
-            - chunk_length
-                The length of the chunk
-        """
-        ret = []
-        truncated_query_ids = feature.query_token_ids[:self._max_query_length]
-        chunks = feature.get_chunks(
-            doc_stride=self._doc_stride,
-            max_chunk_length=self._max_seq_length - len(truncated_query_ids) - 3)
-        for chunk in chunks:
-            data = np.array([self.cls_id] + truncated_query_ids + [self.sep_id] +
-                            feature.context_token_ids[chunk.start:(chunk.start + chunk.length)] +
-                            [self.sep_id], dtype=np.int32)
-            valid_length = len(data)
-            segment_ids = np.array([0] + [0] * len(truncated_query_ids) +
-                                   [0] + [1] * chunk.length + [1], dtype=np.int32)
-            masks = np.array([0] + [1] * len(truncated_query_ids) + [1] + [0] * chunk.length + [1],
-                             dtype=np.int32)
-            context_offset = len(truncated_query_ids) + 2
-            if chunk.gt_start_pos is None and chunk.gt_end_pos is None:
-                start_pos = 0
-                end_pos = 0
-            else:
-                # Here, we increase the start and end because we put query before context
-                start_pos = chunk.gt_start_pos + context_offset
-                end_pos = chunk.gt_end_pos + context_offset
-            chunk_feature = self.ChunkFeature(qas_id=feature.qas_id,
-                                              data=data,
-                                              valid_length=valid_length,
-                                              segment_ids=segment_ids,
-                                              masks=masks,
-                                              is_impossible=chunk.is_impossible,
-                                              gt_start=start_pos,
-                                              gt_end=end_pos,
-                                              context_offset=context_offset,
-                                              chunk_start=chunk.start,
-                                              chunk_length=chunk.length)
-            ret.append(chunk_feature)
-        return ret
-
-    def get_train(self, features, skip_unreliable=True):
-        """Get the training dataset
-
-        Parameters
-        ----------
-        features
-        skip_unreliable
-            Whether to skip the unreliable spans in the training set
-
-        Returns
-        -------
-        train_dataset
-        num_token_answer_mismatch
-        num_unreliable
-        """
-        train_dataset = []
-        num_token_answer_mismatch = 0
-        num_unreliable = 0
-        for feature in features:
-            if feature.token_answer_mismatch:
-                num_token_answer_mismatch += 1
-            if feature.unreliable_span:
-                num_unreliable += 1
-            if skip_unreliable and feature.unreliable_span:
-                # Skip when not reliable
-                continue
-            # Process the feature
-            chunk_features = self.process_sample(feature)
-            train_dataset.extend(chunk_features)
-        return train_dataset, num_token_answer_mismatch, num_unreliable
-
 
 def get_network(model_name,
                 ctx_l,
@@ -342,11 +80,12 @@ def get_network(model_name,
         logging.info(
             'Loading Backbone Model from {}, with total/fixd parameters={}/{}'.format(
                 backbone_params_path, num_params, num_fixed_params))
-    qa_net = ModelForQAConditionalV1(backbone=backbone,
-                                     dropout_prob=dropout,
-                                     weight_initializer=TruncNorm(stdev=0.02),
-                                     use_segmentation=use_segmentation,
-                                     prefix='qa_net_')
+
+    qa_net = ModelForQABasic(backbone=backbone,
+                             weight_initializer=TruncNorm(stdev=0.02),
+                             use_segmentation=use_segmentation,
+                             prefix='qa_net_')
+
     if checkpoint_path is None:
         # Ignore the UserWarning during initialization,
         # There is no need to re-initialize the parameters of backbone
@@ -510,8 +249,6 @@ def train(args):
     num_samples_per_update = 0
     loss_denom = float(len(ctx_l) * args.num_accumulated)
 
-    log_span_loss = 0
-    log_answerable_loss = 0
     log_total_loss = 0
     log_sample_num = 0
     if args.num_accumulated != 1:
@@ -525,8 +262,6 @@ def train(args):
             grouper(repeat(train_dataloader), len(ctx_l) * args.num_accumulated)):
         for sample_l in grouper(batch_data, len(ctx_l)):
             loss_l = []
-            span_loss_l = []
-            answerable_loss_l = []
             for sample, ctx in zip(sample_l, ctx_l):
                 if sample is None:
                     continue
@@ -543,26 +278,19 @@ def train(args):
                 batch_idx = mx.np.arange(tokens.shape[0], dtype=np.int32, ctx=ctx)
                 p_mask = 1 - p_mask  # In the network, we use 1 --> no_mask, 0 --> mask
                 with mx.autograd.record():
-                    start_logits, end_logits, answerable_logits \
-                        = qa_net(tokens, segment_ids, valid_length, p_mask, gt_start)
+                    start_logits, end_logits \
+                        = qa_net(tokens, segment_ids, valid_length, p_mask)
                     sel_start_logits = start_logits[batch_idx, gt_start]
                     sel_end_logits = end_logits[batch_idx, gt_end]
-                    sel_answerable_logits = answerable_logits[batch_idx, is_impossible]
                     span_loss = - 0.5 * (sel_start_logits + sel_end_logits).sum()
-                    answerable_loss = - 0.5 * sel_answerable_logits.sum()
-                    loss = (span_loss + answerable_loss) / loss_denom
+                    loss = span_loss / loss_denom
                     loss_l.append(loss)
-                    span_loss_l.append(span_loss)
-                    answerable_loss_l.append(answerable_loss)
 
             for loss in loss_l:
                 loss.backward()
             # All Reduce the Step Loss
-            log_span_loss += sum([ele.as_in_ctx(ctx_l[0]) for ele in span_loss_l]).asnumpy()
             log_total_loss += sum([ele.as_in_ctx(ctx_l[0])
                                    for ele in loss_l]).asnumpy() * loss_denom
-            log_answerable_loss += sum([ele.as_in_ctx(ctx_l[0])
-                                        for ele in answerable_loss_l]).asnumpy()
         # update
         trainer.allreduce_grads()
         # Here, the accumulated gradients are
@@ -572,7 +300,7 @@ def train(args):
         # We need to change the ratio to be
         #  \sum_{n=1}^N g_n / loss_denom  -->  clip to args.max_grad_norm  * N / loss_denom
         total_norm, ratio, is_finite = clip_grad_global_norm(
-            params, args.max_grad_norm, loss_denom / num_samples_per_update)
+            params, args.max_grad_norm * num_samples_per_update / loss_denom)
         total_norm = total_norm / (num_samples_per_update / loss_denom)
 
         trainer.update(num_samples_per_update / loss_denom, ignore_stale_grad=True)
@@ -599,20 +327,16 @@ def train(args):
 
         # logging
         if (step_num + 1) % log_interval == 0:
-            log_span_loss /= log_sample_num
-            log_answerable_loss /= log_sample_num
             log_total_loss /= log_sample_num
             toc = time.time()
             logging.info(
-                'Step: {}/{}, Loss span/answer/total={:.4f}/{:.4f}/{:.4f},'
+                'Step: {}/{}, Loss span={:.4f},'
                 ' LR={:.8f}, grad_norm={:.4f}. Time cost={:.2f}, Throughput={:.2f} samples/s'
-                ' ETA={:.2f}h'.format((step_num + 1), num_train_steps, log_span_loss,
-                                      log_answerable_loss, log_total_loss, trainer.learning_rate, total_norm,
+                ' ETA={:.2f}h'.format((step_num + 1), num_train_steps, log_total_loss,
+                                      trainer.learning_rate, total_norm,
                                       toc - tic, log_sample_num / (toc - tic),
                                       (num_train_steps - (step_num + 1)) / ((step_num + 1) / (toc - global_tic)) / 3600))
             tic = time.time()
-            log_span_loss = 0
-            log_answerable_loss = 0
             log_total_loss = 0
             log_sample_num = 0
             num_samples_per_update = 0
@@ -630,14 +354,13 @@ RawResultExtended = collections.namedtuple(
      'start_top_logits',
      'start_top_index',
      'end_top_logits',
-     'end_top_index',
-     'answerable_logits'])
+     'end_top_index'])
 
 
 def predict_extended(original_feature,
                      chunked_features,
                      results,
-                     n_best_size,
+                     n_best_size=20,
                      max_answer_length=64,
                      start_top_n=5,
                      end_top_n=5):
@@ -671,7 +394,7 @@ def predict_extended(original_feature,
     nbest_json
         n-best predictions with their probabilities.
     """
-    not_answerable_score = 1000000  # Score for not-answerable. We set it to be a large and positive
+    score_null = 1000000  # Score for not-answerable. We set it to be a large and positive
     # If one chunk votes for answerable, we will treat the context as answerable,
     # Thus, the overall not_answerable_score = min(chunk_not_answerable_score)
     all_start_idx = []
@@ -695,18 +418,19 @@ def predict_extended(original_feature,
     for chunk_id, (result, chunk_feature) in enumerate(zip(results, chunked_features)):
         # We use the log-likelihood as the not answerable score.
         # Thus, a high score indicates that the answer is not answerable
-        cur_not_answerable_score = float(result.answerable_logits[1])
-        not_answerable_score = min(not_answerable_score, cur_not_answerable_score)
+
         # Calculate the start_logits + end_logits as the overall score
         context_offset = chunk_feature.context_offset
         chunk_start = chunk_feature.chunk_start
         chunk_length = chunk_feature.chunk_length
         for i in range(start_top_n):
             for j in range(end_top_n):
-                pred_score = result.start_top_logits[i] + result.end_top_logits[i, j]
+                pred_score = float(result.start_top_logits[i] + result.end_top_logits[j])
+                score_null = min(pred_score, score_null)
+
                 start_index = result.start_top_index[i]
-                end_index = result.end_top_index[i, j]
-                # We could hypothetically create invalid predictions, e.g. predict
+                end_index = result.end_top_index[j]
+                # We could hypothetically create invalid predictions, e.g., predict
                 # that the start of the answer span is in the query tokens or out of
                 # the chunk. We throw out all invalid predictions.
                 if not (context_offset <= start_index < context_offset + chunk_length) or \
@@ -723,6 +447,11 @@ def predict_extended(original_feature,
                 all_start_idx.append(start_idx)
                 all_end_idx.append(end_idx)
                 all_pred_score.append(pred_score)
+
+    all_start_idx.append(-1)
+    all_end_idx.append(-1)
+    all_pred_score.append(score_null)
+
     sorted_start_end_score = sorted(zip(all_start_idx, all_end_idx, all_pred_score),
                                     key=lambda args: args[-1], reverse=True)
     nbest = []
@@ -732,8 +461,11 @@ def predict_extended(original_feature,
     for start_idx, end_idx, pred_score in sorted_start_end_score:
         if len(seen_predictions) >= n_best_size:
             break
-        pred_answer = context_text[context_token_offsets[start_idx][0]:
-                                   context_token_offsets[end_idx][1]]
+        if start_idx >= 0 and end_idx >=0:
+            pred_answer = context_text[context_token_offsets[start_idx][0]:
+                                       context_token_offsets[end_idx][1]]
+        else:
+            pred_answer = ""
         seen_predictions.add(pred_answer)
         nbest.append((pred_answer, pred_score))
 
@@ -751,6 +483,7 @@ def predict_extended(original_feature,
         nbest_json.append(output)
 
     assert len(nbest_json) >= 1
+    not_answerable_score = score_null - float(nbest[0][1])
     return not_answerable_score, nbest[0][0], nbest_json
 
 
@@ -826,7 +559,7 @@ def evaluate(args, last=True):
                 valid_length = sample.valid_length.as_in_ctx(ctx)
                 p_mask = sample.masks.as_in_ctx(ctx)
                 p_mask = 1 - p_mask  # In the network, we use 1 --> no_mask, 0 --> mask
-                start_top_logits, start_top_index, end_top_logits, end_top_index, answerable_logits \
+                start_top_logits, start_top_index, end_top_logits, end_top_index \
                     = qa_net.inference(tokens, segment_ids, valid_length, p_mask,
                                        args.start_top_n, args.end_top_n)
                 for i, qas_id in enumerate(sample.qas_id):
@@ -834,8 +567,7 @@ def evaluate(args, last=True):
                                                start_top_logits=start_top_logits[i].asnumpy(),
                                                start_top_index=start_top_index[i].asnumpy(),
                                                end_top_logits=end_top_logits[i].asnumpy(),
-                                               end_top_index=end_top_index[i].asnumpy(),
-                                               answerable_logits=answerable_logits[i].asnumpy())
+                                               end_top_index=end_top_index[i].asnumpy())
 
                     all_results.append(result)
 

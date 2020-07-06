@@ -15,7 +15,7 @@ from mxnet.lr_scheduler import PolyScheduler
 
 from sklearn import metrics
 from pretraining_utils import ElectraMasker, get_pretrain_data_npz, get_pretrain_data_text
-from gluonnlp.utils.misc import grouper, set_seed, naming_convention, logging_config
+from gluonnlp.utils.misc import grouper, repeat, set_seed, naming_convention, logging_config
 from gluonnlp.initializer import TruncNorm
 from gluonnlp.models.electra import ElectraModel, ElectraForPretrain, get_pretrained_electra
 from gluonnlp.utils.parameter import clip_grad_global_norm
@@ -72,9 +72,10 @@ def parse_args():
                         help='If set, both training and dev samples are generated on-the-fly '
                              'from raw texts instead of pre-processed npz files. ')
     parser.add_argument("--short_seq_prob", type=float, default=0.05,
-                        help="The probability of sampling sequences shorter than the max_seq_length.")
+                        help='The probability of sampling sequences '
+                             'shorter than the max_seq_length.')
     parser.add_argument("--cached_file_path", default=None,
-                        help="Directory for saving preprocessed features")
+                        help='Directory for saving preprocessed features')
     parser.add_argument('--circle_length', type=int, default=2,
                         help='Number of files to be read for a single GPU at the same time.')
     parser.add_argument('--repeat', type=int, default=8,
@@ -201,6 +202,7 @@ def init_comm(backend, gpus):
 
     return store, num_workers, rank, local_rank, is_master_node, ctx_l
 
+
 def final_save(model, save_dir, tokenizer):
     if not os.path.exists(save_dir):
         os.makedirs(save_dir)
@@ -271,7 +273,7 @@ def train(args):
                  'num_workers: {}, rank: {}'.format(
                      args.num_buckets, num_workers, rank))
     if args.from_raw_text:
-        if not os.path.exists(args.cached_file_path):
+        if args.cached_file_path and not os.path.exists(args.cached_file_path):
             os.mkdir(args.cached_file_path)
         get_dataset_fn = functools.partial(get_pretrain_data_text,
                                            max_seq_length=args.max_seq_length,
@@ -382,13 +384,11 @@ def train(args):
     if args.num_accumulated != 1:
         # set grad to zero for gradient accumulation
         model.collect_params().zero_grad()
-    while not finish_flag:
+
+    # start training
+    for batch_data in grouper(repeat(data_train), len(ctx_l) * args.num_accumulated):
         tic = time.time()
-        batch_id = 0
-        is_last_batch = False
-        train_dataloader = grouper(data_train, len(ctx_l))
-        sample_l = next(train_dataloader)
-        while not is_last_batch:
+        for sample_l in grouper(batch_data, len(ctx_l)):
             loss_l = []
             mlm_loss_l = []
             rtd_loss_l = []
@@ -438,76 +438,66 @@ def train(args):
                                  for ele in rtd_loss_l]).asnumpy()
             log_total_loss += sum([ele.as_in_ctx(ctx_l[0])
                                    for ele in loss_l]).asnumpy() * loss_denom
-            # pre fetch next batch
-            try:
-                sample_l = next(train_dataloader)
-            except StopIteration:
-                is_last_batch = True
 
-            # update
-            if (batch_id + 1) % args.num_accumulated == 0 or is_last_batch:
-                trainer.allreduce_grads()
-                # Here, the accumulated gradients are
-                # \sum_{n=1}^N g_n / loss_denom
-                # Thus, in order to clip the average gradient
-                #   \frac{1}{N} \sum_{n=1}^N      -->  clip to args.max_grad_norm
-                # We need to change the ratio to be
-                #  \sum_{n=1}^N g_n / loss_denom  -->  clip to args.max_grad_norm  * N / loss_denom
-                total_norm, ratio, is_finite = clip_grad_global_norm(
-                    params, args.max_grad_norm * num_samples_per_update / loss_denom)
-                total_norm = total_norm / (num_samples_per_update / loss_denom)
-                trainer.update(num_samples_per_update / loss_denom, ignore_stale_grad=True)
-                step_num += 1
-                if args.num_accumulated != 1:
-                    # set grad to zero for gradient accumulation
-                    model.collect_params().zero_grad()
+        # update
+        trainer.allreduce_grads()
+        # Here, the accumulated gradients are
+        # \sum_{n=1}^N g_n / loss_denom
+        # Thus, in order to clip the average gradient
+        #   \frac{1}{N} \sum_{n=1}^N      -->  clip to args.max_grad_norm
+        # We need to change the ratio to be
+        #  \sum_{n=1}^N g_n / loss_denom  -->  clip to args.max_grad_norm  * N / loss_denom
+        total_norm, ratio, is_finite = clip_grad_global_norm(
+            params, args.max_grad_norm, loss_denom / num_samples_per_update)
+        total_norm = total_norm / (num_samples_per_update / loss_denom)
+        trainer.update(num_samples_per_update / loss_denom, ignore_stale_grad=True)
+        step_num += 1
+        if args.num_accumulated != 1:
+            # set grad to zero for gradient accumulation
+            model.collect_params().zero_grad()
 
-                # saving
-                if step_num % save_interval == 0 or step_num >= num_train_steps:
-                    if is_master_node:
-                        states_option(
-                            step_num, trainer, args.output_dir, local_rank, 'Saving')
-                        if local_rank == 0:
-                            param_path = parameters_option(
-                                step_num, model, args.output_dir, 'Saving')
+        # saving
+        if step_num % save_interval == 0 or step_num >= num_train_steps:
+            if is_master_node:
+                states_option(
+                    step_num, trainer, args.output_dir, local_rank, 'Saving')
+                if local_rank == 0:
+                    param_path = parameters_option(
+                        step_num, model, args.output_dir, 'Saving')
 
-                # logging
-                if step_num % log_interval == 0 and local_rank == 0:
-                    # Output the loss of per step
-                    log_mlm_loss /= log_interval
-                    log_rtd_loss /= log_interval
-                    log_total_loss /= log_interval
-                    toc = time.time()
-                    logging.info(
-                        '[step {}], Loss mlm/rtd/total={:.4f}/{:.4f}/{:.4f},'
-                        ' LR={:.6f}, grad_norm={:.4f}. Time cost={:.2f},'
-                        ' Throughput={:.2f} samples/s, ETA={:.2f}h'.format(
-                            step_num, log_mlm_loss, log_rtd_loss, log_total_loss,
-                            trainer.learning_rate, total_norm, toc - tic, log_sample_num / (toc - tic),
-                            (num_train_steps - step_num) / (step_num / (toc - train_start_time)) / 3600))
-                    tic = time.time()
+        # logging
+        if step_num % log_interval == 0 and local_rank == 0:
+            # Output the loss of per step
+            log_mlm_loss /= log_interval
+            log_rtd_loss /= log_interval
+            log_total_loss /= log_interval
+            toc = time.time()
+            logging.info(
+                '[step {}], Loss mlm/rtd/total={:.4f}/{:.4f}/{:.4f},'
+                ' LR={:.6f}, grad_norm={:.4f}. Time cost={:.2f},'
+                ' Throughput={:.2f} samples/s, ETA={:.2f}h'.format(
+                    step_num, log_mlm_loss, log_rtd_loss, log_total_loss,
+                    trainer.learning_rate, total_norm, toc - tic, log_sample_num / (toc - tic),
+                    (num_train_steps - step_num) / (step_num / (toc - train_start_time)) / 3600))
+            tic = time.time()
 
-                    if args.do_eval:
-                        evaluation(writer, step_num, masked_input, output)
-                        writer.add_scalars('loss',
-                                        {'total_loss': log_total_loss,
-                                         'mlm_loss': log_mlm_loss,
-                                         'rtd_loss': log_rtd_loss},
-                                         step_num)
-                    log_mlm_loss = 0
-                    log_rtd_loss = 0
-                    log_total_loss = 0
-                    log_sample_num = 0
+            if args.do_eval:
+                evaluation(writer, step_num, masked_input, output)
+                writer.add_scalars('loss',
+                                   {'total_loss': log_total_loss,
+                                    'mlm_loss': log_mlm_loss,
+                                    'rtd_loss': log_rtd_loss},
+                                   step_num)
+            log_mlm_loss = 0
+            log_rtd_loss = 0
+            log_total_loss = 0
+            log_sample_num = 0
 
-                num_samples_per_update = 0
+        num_samples_per_update = 0
 
-            if step_num >= num_train_steps:
-                logging.info('Finish training step: %d', step_num)
-                finish_flag = True
-                break
-
-            batch_id += 1
-
+        if step_num >= num_train_steps:
+            logging.info('Finish training step: %d', step_num)
+            break
 
     if is_master_node:
         state_path = states_option(step_num, trainer, args.output_dir, local_rank, 'Saving')
@@ -525,7 +515,7 @@ def train(args):
     final_save(model, save_dir, tokenizer)
     return param_path, state_path
 
-
+# TODO(zheyuye), Directly implement a metric for weighted accuracy
 def accuracy(labels, predictions, weights=None):
     if weights is None:
         weights = mx.np.ones_like(labels)
@@ -533,19 +523,19 @@ def accuracy(labels, predictions, weights=None):
     acc = (is_correct * weights).sum() / (weights.sum() + 1e-6)
     return acc
 
-
-def auc(labels, probs, wights=None):
+# TODO(zheyuye), Directly implement a metric for weighted AUC
+def auc(labels, probs, weights=None):
     if isinstance(labels, mx.np.ndarray):
         labels = labels.asnumpy()
     if isinstance(probs, mx.np.ndarray):
         probs = probs.asnumpy()
-    if isinstance(wights, mx.np.ndarray):
-        wights = wights.asnumpy()
+    if isinstance(weights, mx.np.ndarray):
+        weights = weights.asnumpy()
     labels = labels.reshape(-1)
     probs = probs.reshape(-1)
-    wights = wights.reshape(-1)
+    weights = weights.reshape(-1)
 
-    fpr, tpr, thresholds = metrics.roc_curve(labels, probs, sample_weight=wights)
+    fpr, tpr, thresholds = metrics.roc_curve(labels, probs, sample_weight=weights)
     return metrics.auc(fpr, tpr)
 
 
@@ -570,13 +560,14 @@ def evaluation(writer, step_num, masked_input, eval_input):
     rtd_recall = accuracy(rtd_labels, rtd_preds, rtd_labels * rtd_preds)
     rtd_auc = auc(rtd_labels, rtd_probs, length_masks)
     writer.add_scalars('results',
-                    {'mlm_accuracy': mlm_accuracy.asnumpy().item(),
-                     'corrupted_mlm_accuracy': corrupted_mlm_accuracy.asnumpy().item(),
-                     'rtd_accuracy': rtd_accuracy.asnumpy().item(),
-                     'rtd_precision': rtd_precision.asnumpy().item(),
-                     'rtd_recall': rtd_recall.asnumpy().item(),
-                     'rtd_auc':rtd_auc},
-                     step_num)
+                       {'mlm_accuracy': mlm_accuracy.asnumpy().item(),
+                        'corrupted_mlm_accuracy': corrupted_mlm_accuracy.asnumpy().item(),
+                        'rtd_accuracy': rtd_accuracy.asnumpy().item(),
+                        'rtd_precision': rtd_precision.asnumpy().item(),
+                        'rtd_recall': rtd_recall.asnumpy().item(),
+                        'rtd_auc': rtd_auc},
+                       step_num)
+
 
 if __name__ == '__main__':
     os.environ['MXNET_GPU_MEM_POOL_TYPE'] = 'Round'
