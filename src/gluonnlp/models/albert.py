@@ -200,6 +200,7 @@ class AlbertModel(HybridBlock):
                  params=None):
         super().__init__(prefix=prefix, params=params)
         self._dtype = dtype
+        self.num_heads = num_heads
         self.use_pooler = use_pooler
         self.pos_embed_type = pos_embed_type
         self.num_token_types = num_token_types

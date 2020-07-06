@@ -430,6 +430,7 @@ class MobileBertModel(HybridBlock):
                  params=None):
         super().__init__(prefix=prefix, params=params)
         self._dtype = dtype
+        self.num_heads = num_heads
         self.use_bottleneck = use_bottleneck
         self.bottleneck_strategy = bottleneck_strategy
         self.trigram_embed = trigram_embed

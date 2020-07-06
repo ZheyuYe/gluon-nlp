@@ -18,7 +18,7 @@ from mxnet.lr_scheduler import PolyScheduler
 
 import gluonnlp.data.batchify as bf
 from models import ModelForAnswerable
-from eval_utils import squad_eval
+from eval_utils import squad_eval, answerable_eval
 from squad_utils import SquadFeature, get_squad_examples, convert_squad_example_to_feature
 from gluonnlp.models import get_backbone
 from gluonnlp.utils.misc import grouper, repeat, set_seed, parse_ctx, logging_config, count_parameters
@@ -343,6 +343,7 @@ def get_network(model_name,
             'Loading Backbone Model from {}, with total/fixd parameters={}/{}'.format(
                 backbone_params_path, num_params, num_fixed_params))
     qa_net = ModelForAnswerable(backbone=backbone,
+                                dropout_prob=dropout,
                                 weight_initializer=TruncNorm(stdev=0.02),
                                 use_segmentation=use_segmentation,
                                 prefix='qa_net_')
@@ -749,7 +750,7 @@ def evaluate(args, last=True):
                 log_num += len(tokens)
                 segment_ids = sample.segment_ids.as_in_ctx(ctx) if use_segmentation else None
                 valid_length = sample.valid_length.as_in_ctx(ctx)
-                p_mask = sample.masks.as_in_ctx(ctx) 
+                p_mask = sample.masks.as_in_ctx(ctx)
                 p_mask = 1 - p_mask  # In the network, we use 1 --> no_mask, 0 --> mask
                 answerable_logits = qa_net(tokens, segment_ids, valid_length,  p_mask)
                 for i, qas_id in enumerate(sample.qas_id):
@@ -798,21 +799,12 @@ def evaluate(args, last=True):
                 end_top_n=args.end_top_n)
             no_answer_score_json[example_qas_id] = not_answerable_score
 
-        if args.version == '2.0':
-            exact = 'best_exact'
-            f1 = 'best_f1'
-            na_prob = no_answer_score_json
-        else:
-            exact = 'exact'
-            f1 = 'f1'
-            na_prob = None
-
-        cur_eval = answerable_eval(dev_data_path, na_prob)
+        cur_eval = answerable_eval(dev_data_path, no_answer_score_json)
         logging.info('The evaluated results are {}'.format(json.dumps(cur_eval)))
 
-        cur_metrics = 0.5 * (cur_eval[exact] + cur_eval[f1])
+        cur_metrics = cur_eval['accuracy']
         if best_eval:
-            best_metrics = 0.5 * (best_eval[exact] + best_eval[f1])
+            best_metrics = best_eval['accuracy']
         else:
             best_metrics = 0.
 

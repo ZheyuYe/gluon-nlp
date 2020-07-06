@@ -177,7 +177,7 @@ class RobertaModel(HybridBlock):
         self.activation = activation
         self.pooler_activation = pooler_activation
         self.layer_norm_eps = layer_norm_eps
-        self.dtype = dtype
+        self._dtype = dtype
         self.use_pooler = use_pooler
         self.use_mlm = use_mlm
         self.untie_weight = untie_weight
@@ -188,7 +188,7 @@ class RobertaModel(HybridBlock):
                 input_dim=self.vocab_size,
                 output_dim=self.units,
                 weight_initializer=embed_initializer,
-                dtype=self.dtype,
+                dtype=self._dtype,
                 prefix='tokens_embed_'
             )
             if self.encoder_normalize_before:
@@ -203,7 +203,7 @@ class RobertaModel(HybridBlock):
             self.pos_embed = PositionalEmbedding(
                 units=self.units,
                 max_length=self.max_length,
-                dtype=self.dtype,
+                dtype=self._dtype,
                 method=pos_embed_type,
                 prefix='pos_embed_'
             )
@@ -219,7 +219,7 @@ class RobertaModel(HybridBlock):
                 weight_initializer=weight_initializer,
                 bias_initializer=bias_initializer,
                 activation=self.activation,
-                dtype=self.dtype,
+                dtype=self._dtype,
                 output_all_encodings=self.output_all_encodings
             )
             self.encoder.hybridize()
@@ -376,7 +376,7 @@ class RobertaEncoder(HybridBlock):
         self.hidden_dropout_prob = hidden_dropout_prob
         self.layer_norm_eps = layer_norm_eps
         self.activation = activation
-        self.dtype = dtype
+        self._dtype = dtype
         self.output_all_encodings = output_all_encodings
         with self.name_scope():
             self.all_layers = nn.HybridSequential(prefix='layers_')
@@ -393,14 +393,14 @@ class RobertaEncoder(HybridBlock):
                             weight_initializer=weight_initializer,
                             bias_initializer=bias_initializer,
                             activation=self.activation,
-                            dtype=self.dtype,
+                            dtype=self._dtype,
                             prefix='{}_'.format(layer_idx)
                         )
                     )
 
     def hybrid_forward(self, F, x, valid_length):
         atten_mask = gen_self_attn_mask(F, x, valid_length,
-                                        dtype=self.dtype, attn_type='full')
+                                        dtype=self._dtype, attn_type='full')
         inner_states = [x]
         for layer_idx in range(self.num_layers):
             layer = self.all_layers[layer_idx]
