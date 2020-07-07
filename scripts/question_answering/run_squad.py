@@ -23,7 +23,7 @@ from squad_utils import SquadFeature, get_squad_examples, convert_squad_example_
 from gluonnlp.models import get_backbone
 from gluonnlp.utils.misc import grouper, repeat, set_seed, parse_ctx, logging_config, count_parameters
 from gluonnlp.initializer import TruncNorm
-from gluonnlp.utils.parameter import clip_grad_global_norm, multiply_grads
+from gluonnlp.utils.parameter import clip_grad_global_norm
 
 mx.npx.set_np()
 
@@ -298,7 +298,7 @@ def get_network(model_name,
                 ctx_l,
                 dropout=0.1,
                 checkpoint_path=None,
-                backbone_path=None
+                backbone_path=None,
                 qa_model_type = 'conditional'):
     """
     Get the network that fine-tune the Question Answering Task
@@ -584,18 +584,16 @@ def train(args):
         # update
         trainer.allreduce_grads()
 
-        if args.max_grad_norm > 0:
-            # Here, the accumulated gradients are
-            # \sum_{n=1}^N g_n / loss_denom
-            # Thus, in order to clip the average gradient
-            #   \frac{1}{N} \sum_{n=1}^N      -->  clip to args.max_grad_norm
-            # We need to change the ratio to be
-            #  \sum_{n=1}^N g_n / loss_denom  -->  clip to args.max_grad_norm  * N / loss_denom
-            total_norm, ratio, is_finite = clip_grad_global_norm(
-                params, args.max_grad_norm * num_samples_per_update / loss_denom)
-            total_norm = total_norm / (num_samples_per_update / loss_denom)
-        else:
-            total_norm, is_finite = multiply_grads(params, loss_denom / num_samples_per_update)
+
+        # Here, the accumulated gradients are
+        # \sum_{n=1}^N g_n / loss_denom
+        # Thus, in order to clip the average gradient
+        #   \frac{1}{N} \sum_{n=1}^N      -->  clip to args.max_grad_norm
+        # We need to change the ratio to be
+        #  \sum_{n=1}^N g_n / loss_denom  -->  clip to args.max_grad_norm  * N / loss_denom
+        total_norm, ratio, is_finite = clip_grad_global_norm(
+            params, args.max_grad_norm * num_samples_per_update / loss_denom)
+        total_norm = total_norm / (num_samples_per_update / loss_denom)
 
         trainer.update(num_samples_per_update / loss_denom)
         if args.num_accumulated != 1:
@@ -848,9 +846,9 @@ def evaluate(args, last=True):
                 valid_length = sample.valid_length.as_in_ctx(ctx)
                 p_mask = sample.masks.as_in_ctx(ctx)
                 p_mask = 1 - p_mask  # In the network, we use 1 --> no_mask, 0 --> mask
-                start_top_logits, start_top_index, end_top_logits, end_top_index, answerable_logits \
-                    = qa_net.inference(tokens, segment_ids, valid_length, p_mask,
-                                       args.start_top_n, args.end_top_n)
+                start_top_logits, start_top_index, end_top_logits, end_top_index, answerable_logits, \
+                    pos_cls_logits = qa_net.inference(tokens, segment_ids, valid_length, p_mask, a_mask,
+                                                        args.start_top_n, args.end_top_n)
                 for i, qas_id in enumerate(sample.qas_id):
                     result = RawResultExtended(qas_id=qas_id,
                                                start_top_logits=start_top_logits[i].asnumpy(),

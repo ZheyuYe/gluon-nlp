@@ -15,13 +15,13 @@ from multiprocessing import Pool, cpu_count
 import mxnet as mx
 import numpy as np
 
-from models import ModelForQAConditionalV1
 from run_squad import RawResultExtended, SquadDatasetProcessor
 from eval_utils import squad_eval
 from squad_utils import SquadFeature, get_squad_examples, convert_squad_example_to_feature, ml_voter
 from gluonnlp.models import get_backbone
 from gluonnlp.utils.misc import grouper, set_seed, parse_ctx, logging_config
 from gluonnlp.initializer import TruncNorm
+from run_squad import get_network
 
 mx.npx.set_np()
 
@@ -87,28 +87,12 @@ def parse_args():
     args = parser.parse_args()
     return args
 
-
-def get_network(model_name, dropout=0.1):
-    # Create the network
-    Model, cfg, tokenizer, _, _ = get_backbone(model_name, load_backbone=False)
-    backbone = Model.from_cfg(cfg, use_pooler=False)
-
-    qa_net = ModelForQAConditionalV1(backbone=backbone,
-                                     dropout_prob=dropout,
-                                     weight_initializer=TruncNorm(stdev=0.02),
-                                     prefix='qa_net_')
-    qa_net.hybridize()
-
-    return cfg, tokenizer, qa_net
-
-
 SinglePredict = collections.namedtuple(
     'SinglePredict',
     ['start_idx',
      'end_idx',
      'has_score',
      'no_score',
-     'plau_score',
      'cls_score'])
 
 
@@ -173,7 +157,6 @@ def predict_extended(feature,
         # The second item is an additional logits represents the sum of
         # logits of the cls token in start and end positions.
         cur_not_answerable_score = float(result.answerable_logits[1])
-        plau_score = float(result.plausible_logits[1])
         pos_cls_score = float(result.pos_cls_logits)
         # Calculate the start_logits + end_logits as the overall score
         context_offset = chunk_feature.context_offset
@@ -203,7 +186,6 @@ def predict_extended(feature,
                     start_idx=start_idx,
                     end_idx=end_idx,
                     has_score=has_score,
-                    plau_score=plau_score,
                     no_score=cur_not_answerable_score,
                     cls_score=pos_cls_score,
                 )
@@ -212,7 +194,7 @@ def predict_extended(feature,
     return start_end
 
 
-def inference(args, qa_model, features, dataset_processor):
+def inference(args, qa_net, features, dataset_processor):
     """
     Model inference during validation or final evaluation.
     """
@@ -249,13 +231,13 @@ def inference(args, qa_model, features, dataset_processor):
             tokens = sample.data.as_in_ctx(ctx)
             total_num += len(tokens)
             log_num += len(tokens)
-            segment_ids = sample.segment_ids.as_in_ctx(ctx)
+            segment_ids = sample.segment_ids.as_in_ctx(ctx) if qa_net.use_segmentation else None
             valid_length = sample.valid_length.as_in_ctx(ctx)
             p_mask = sample.masks.as_in_ctx(ctx)
             a_mask = sample.answer_masks.as_in_ctx(ctx)
             p_mask = 1 - p_mask  # In the network, we use 1 --> no_mask, 0 --> mask
             start_top_logits, start_top_index, end_top_logits, end_top_index, answerable_logits, \
-                plausible_logits, pos_cls_logits = qa_model.inference(tokens, segment_ids, valid_length, p_mask, a_mask,
+                pos_cls_logits = qa_net.inference(tokens, segment_ids, valid_length, p_mask, a_mask,
                                                     args.start_top_n, args.end_top_n)
             for i, qas_id in enumerate(sample.qas_id):
                 result = RawResultExtended(qas_id=qas_id,
@@ -264,7 +246,6 @@ def inference(args, qa_model, features, dataset_processor):
                                            end_top_logits=end_top_logits[i].asnumpy(),
                                            end_top_index=end_top_index[i].asnumpy(),
                                            answerable_logits=answerable_logits[i].asnumpy(),
-                                           plausible_logits=plausible_logits[i].asnumpy(),
                                            pos_cls_logits=pos_cls_logits[i].asnumpy())
 
                 all_results.append(result)
@@ -313,8 +294,7 @@ def inference(args, qa_model, features, dataset_processor):
 
 def ensemble(args, is_save=True):
     ctx_l = parse_ctx(args.gpus)
-    cfg, tokenizer, qa_net = get_network(
-        args.model_name, args.classifier_dropout)
+    Model, cfg, tokenizer, _, _ = get_backbone(args.model_name, load_backbone=False)
     if not args.voter_path:
         # prepare train set
         train_cache_path = os.path.join(
@@ -377,12 +357,11 @@ def ensemble(args, is_save=True):
 
     def inference_single_ckpt(param_checkpoint, all_start_ends, features):
         logging.info('Inference the fine-tuned parameters {}'.format(param_checkpoint))
-        qa_net.load_parameters(
-            param_checkpoint,
-            ctx=ctx_l,
-            cast_dtype=True,
-            ignore_extra=True,
-            allow_missing=True)
+        cfg, tokenizer, qa_net, use_segmentation = get_network(
+            args.model_name, ctx_l,
+            args.classifier_dropout,
+            checkpoint_path=param_checkpoint,
+            qa_model_type='conditional')
         cur_features = inference(args, qa_net, features, dataset_processor)
 
         # update all_start_ends
@@ -397,14 +376,13 @@ def ensemble(args, is_save=True):
         all_scores = {}
         for qas_id, start_end_list in all_start_ends.items():
             has_ans_dict = collections.OrderedDict()
-            no_score, cls_score, plau_score = 10000000, 10000000, 10000000
+            no_score, cls_score = 10000000, 10000000
             for instance in start_end_list:
                 start = instance.start_idx
                 end = instance.end_idx
                 has_score = instance.has_score
                 cls_score = min(instance.cls_score, cls_score)
                 no_score = min(instance.no_score, no_score)
-                plau_score = min(instance.plau_score, plau_score)
 
                 if (start, end) not in has_ans_dict:
                     has_ans_dict[(start, end)] = [has_score]
@@ -421,9 +399,9 @@ def ensemble(args, is_save=True):
             else:
                 # There is no valid after inference
                 start_idx, end_idx = 0, 0
-                highest_has_score, no_score, cls_score, plau_score = -10000000, 10000000, 10000000, 10000000
+                highest_has_score, no_score, cls_score = - 10000000, 10000000, 10000000
             all_predictions[qas_id] = (start_idx, end_idx)
-            all_scores[qas_id] = [highest_has_score, no_score, plau_score, cls_score]
+            all_scores[qas_id] = [highest_has_score, no_score, cls_score]
 
         return all_predictions, all_scores
 

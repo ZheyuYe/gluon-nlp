@@ -22,7 +22,7 @@ def ag_train(args, reporter):
 
     params_saved = train(default_args)
     default_args.params_saved = params_saved
-    out_eval = evaluate(default_args, is_save=False)
+    out_eval = evaluate(default_args, is_last=False)
     results = (out_eval['best_exact'] + out_eval['best_f1']) * 0.5
     reporter(epoch=args.n_epoch, accuracy=results, lr=args.lr, max_grad_norm=args.max_grad_norm)
 
