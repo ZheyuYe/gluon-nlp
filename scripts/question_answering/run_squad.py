@@ -17,13 +17,13 @@ import numpy as np
 from mxnet.lr_scheduler import PolyScheduler
 
 import gluonnlp.data.batchify as bf
-from models import ModelForQAConditionalV1
+from models import ModelForQABasic, ModelForQAConditionalV1, ModelForAnswerable
 from eval_utils import squad_eval
 from squad_utils import SquadFeature, get_squad_examples, convert_squad_example_to_feature
 from gluonnlp.models import get_backbone
 from gluonnlp.utils.misc import grouper, repeat, set_seed, parse_ctx, logging_config, count_parameters
 from gluonnlp.initializer import TruncNorm
-from gluonnlp.utils.parameter import clip_grad_global_norm
+from gluonnlp.utils.parameter import clip_grad_global_norm, multiply_grads
 
 mx.npx.set_np()
 
@@ -298,7 +298,8 @@ def get_network(model_name,
                 ctx_l,
                 dropout=0.1,
                 checkpoint_path=None,
-                backbone_path=None):
+                backbone_path=None
+                qa_model_type = 'conditional'):
     """
     Get the network that fine-tune the Question Answering Task
 
@@ -314,6 +315,8 @@ def get_network(model_name,
         Path to a Fine-tuned checkpoint
     backbone_path: str
         Path to the backbone model to be loaded in qa_net
+    qa_model_type: str
+        The type of the question answering down-stream model
 
     Returns
     -------
@@ -342,11 +345,26 @@ def get_network(model_name,
         logging.info(
             'Loading Backbone Model from {}, with total/fixd parameters={}/{}'.format(
                 backbone_params_path, num_params, num_fixed_params))
-    qa_net = ModelForQAConditionalV1(backbone=backbone,
-                                     dropout_prob=dropout,
-                                     weight_initializer=TruncNorm(stdev=0.02),
-                                     use_segmentation=use_segmentation,
-                                     prefix='qa_net_')
+    if qa_model_type == 'conditional':
+        qa_net = ModelForQAConditionalV1(backbone=backbone,
+                                         dropout_prob=dropout,
+                                         weight_initializer=TruncNorm(stdev=0.02),
+                                         use_segmentation=use_segmentation,
+                                         prefix='qa_net_')
+    elif qa_model_type == 'basic':
+        qa_net = ModelForQABasic(backbone=backbone,
+                                 weight_initializer=TruncNorm(stdev=0.02),
+                                 use_segmentation=use_segmentation,
+                                 prefix='qa_net_')
+    elif qa_model_type == 'answerable':
+        qa_net = ModelForAnswerable(backbone=backbone,
+                                    dropout_prob=dropout,
+                                    weight_initializer=TruncNorm(stdev=0.02),
+                                    use_segmentation=use_segmentation,
+                                    prefix='qa_net_')
+    else:
+        raise NotImplementedError
+
     if checkpoint_path is None:
         # Ignore the UserWarning during initialization,
         # There is no need to re-initialize the parameters of backbone
@@ -549,7 +567,7 @@ def train(args):
                     sel_end_logits = end_logits[batch_idx, gt_end]
                     sel_answerable_logits = answerable_logits[batch_idx, is_impossible]
                     span_loss = - 0.5 * (sel_start_logits + sel_end_logits).sum()
-                    answerable_loss = - 0.5 * sel_answerable_logits.sum()
+                    answerable_loss = -0.5 * sel_answerable_logits.sum()
                     loss = (span_loss + answerable_loss) / loss_denom
                     loss_l.append(loss)
                     span_loss_l.append(span_loss)
@@ -565,17 +583,21 @@ def train(args):
                                         for ele in answerable_loss_l]).asnumpy()
         # update
         trainer.allreduce_grads()
-        # Here, the accumulated gradients are
-        # \sum_{n=1}^N g_n / loss_denom
-        # Thus, in order to clip the average gradient
-        #   \frac{1}{N} \sum_{n=1}^N      -->  clip to args.max_grad_norm
-        # We need to change the ratio to be
-        #  \sum_{n=1}^N g_n / loss_denom  -->  clip to args.max_grad_norm  * N / loss_denom
-        total_norm, ratio, is_finite = clip_grad_global_norm(
-            params, args.max_grad_norm * num_samples_per_update / loss_denom)
-        total_norm = total_norm / (num_samples_per_update / loss_denom)
 
-        trainer.update(num_samples_per_update / loss_denom, ignore_stale_grad=True)
+        if args.max_grad_norm > 0:
+            # Here, the accumulated gradients are
+            # \sum_{n=1}^N g_n / loss_denom
+            # Thus, in order to clip the average gradient
+            #   \frac{1}{N} \sum_{n=1}^N      -->  clip to args.max_grad_norm
+            # We need to change the ratio to be
+            #  \sum_{n=1}^N g_n / loss_denom  -->  clip to args.max_grad_norm  * N / loss_denom
+            total_norm, ratio, is_finite = clip_grad_global_norm(
+                params, args.max_grad_norm * num_samples_per_update / loss_denom)
+            total_norm = total_norm / (num_samples_per_update / loss_denom)
+        else:
+            total_norm, is_finite = multiply_grads(params, loss_denom / num_samples_per_update)
+
+        trainer.update(num_samples_per_update / loss_denom)
         if args.num_accumulated != 1:
             # set grad to zero for gradient accumulation
             qa_net.collect_params().zero_grad()
@@ -706,7 +728,7 @@ def predict_extended(original_feature,
                 pred_score = result.start_top_logits[i] + result.end_top_logits[i, j]
                 start_index = result.start_top_index[i]
                 end_index = result.end_top_index[i, j]
-                # We could hypothetically create invalid predictions, e.g. predict
+                # We could hypothetically create invalid predictions, e.g., predict
                 # that the start of the answer span is in the query tokens or out of
                 # the chunk. We throw out all invalid predictions.
                 if not (context_offset <= start_index < context_offset + chunk_length) or \

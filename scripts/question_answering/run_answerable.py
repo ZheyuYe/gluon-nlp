@@ -17,13 +17,13 @@ import numpy as np
 from mxnet.lr_scheduler import PolyScheduler
 
 import gluonnlp.data.batchify as bf
-from models import ModelForAnswerable
 from eval_utils import squad_eval, answerable_eval
 from squad_utils import SquadFeature, get_squad_examples, convert_squad_example_to_feature
 from gluonnlp.models import get_backbone
 from gluonnlp.utils.misc import grouper, repeat, set_seed, parse_ctx, logging_config, count_parameters
 from gluonnlp.initializer import TruncNorm
 from gluonnlp.utils.parameter import clip_grad_global_norm
+from run_squad import get_network
 
 mx.npx.set_np()
 
@@ -312,70 +312,6 @@ class SquadDatasetProcessor:
         return train_dataset, num_token_answer_mismatch, num_unreliable
 
 
-def get_network(model_name,
-                ctx_l,
-                dropout=0.1,
-                checkpoint_path=None,
-                backbone_path=None):
-    """
-    Get the network that fine-tune the Question Answering Task
-
-    Parameters
-    ----------
-    model_name : str
-        The model name of the backbone model
-    ctx_l :
-        Context list of training device like [mx.gpu(0), mx.gpu(1)]
-    dropout : float
-        Dropout probability of the task specified layer
-    checkpoint_path: str
-        Path to a Fine-tuned checkpoint
-    backbone_path: str
-        Path to the backbone model to be loaded in qa_net
-
-    Returns
-    -------
-    cfg
-    tokenizer
-    qa_net
-    use_segmentation
-    """
-    # Create the network
-    use_segmentation = 'roberta' not in model_name and 'xlmr' not in model_name
-    Model, cfg, tokenizer, download_params_path, _ = \
-        get_backbone(model_name, load_backbone=not backbone_path)
-    backbone = Model.from_cfg(cfg, use_pooler=False)
-    # Load local backbone parameters if backbone_path provided.
-    # Otherwise, download backbone parameters from gluon zoo.
-
-    backbone_params_path = backbone_path if backbone_path else download_params_path
-    if checkpoint_path is None:
-        # TODO(zheyuye), be careful of allow_missing that used to pass the mlm parameters in roberta
-        backbone.load_parameters(
-            backbone_params_path,
-            ignore_extra=True,
-            allow_missing=True,
-            ctx=ctx_l)
-        num_params, num_fixed_params = count_parameters(backbone.collect_params())
-        logging.info(
-            'Loading Backbone Model from {}, with total/fixd parameters={}/{}'.format(
-                backbone_params_path, num_params, num_fixed_params))
-    qa_net = ModelForAnswerable(backbone=backbone,
-                                dropout_prob=dropout,
-                                weight_initializer=TruncNorm(stdev=0.02),
-                                use_segmentation=use_segmentation,
-                                prefix='qa_net_')
-    if checkpoint_path is None:
-        # Ignore the UserWarning during initialization,
-        # There is no need to re-initialize the parameters of backbone
-        qa_net.initialize(ctx=ctx_l)
-    else:
-        qa_net.load_parameters(checkpoint_path, ctx=ctx_l, cast_dtype=True)
-    qa_net.hybridize()
-
-    return cfg, tokenizer, qa_net, use_segmentation
-
-
 def untune_params(model, untunable_depth, not_included=[]):
     """Froze part of parameters according to layer depth.
 
@@ -408,7 +344,8 @@ def train(args):
         get_network(args.model_name, ctx_l,
                     args.classifier_dropout,
                     args.param_checkpoint,
-                    args.backbone_path)
+                    args.backbone_path,
+                    qa_model_type='answerable')
     # Load the data
     train_examples = get_squad_examples(args.data_dir, segment='train', version=args.version)
     logging.info('Load data from {}, Version={}'.format(args.data_dir, args.version))
@@ -680,7 +617,7 @@ def predict_extended(original_feature,
 def evaluate(args, last=True):
     ctx_l = parse_ctx(args.gpus)
     cfg, tokenizer, qa_net, use_segmentation = get_network(
-        args.model_name, ctx_l, args.classifier_dropout)
+        args.model_name, ctx_l, args.classifier_dropout, qa_model_type='answerable')
     # Prepare dev set
     dev_cache_path = os.path.join(CACHE_PATH,
                                   'dev_{}_squad_{}.ndjson'.format(args.model_name,
