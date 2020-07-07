@@ -15,13 +15,13 @@ from multiprocessing import Pool, cpu_count
 import mxnet as mx
 import numpy as np
 
-from run_squad import RawResultExtended, SquadDatasetProcessor
+from run_squad import SquadDatasetProcessor, get_network
+from run_answerable import RawAnswerableProb, answerable_extended
 from eval_utils import squad_eval
 from squad_utils import SquadFeature, get_squad_examples, convert_squad_example_to_feature, ml_voter
 from gluonnlp.models import get_backbone
 from gluonnlp.utils.misc import grouper, set_seed, parse_ctx, logging_config
 from gluonnlp.initializer import TruncNorm
-from run_squad import get_network
 
 mx.npx.set_np()
 
@@ -95,6 +95,15 @@ SinglePredict = collections.namedtuple(
      'no_score',
      'cls_score'])
 
+RawResultExtended = collections.namedtuple(
+    'RawResultExtended',
+    ['qas_id',
+     'start_top_logits',
+     'start_top_index',
+     'end_top_logits',
+     'end_top_index',
+     'pos_cls_logits',
+     'answerable_logits'])
 
 def predict_extended(feature,
                      chunked_features,
@@ -194,7 +203,7 @@ def predict_extended(feature,
     return start_end
 
 
-def inference(args, qa_net, features, dataset_processor):
+def inference(args, qa_net, qa_model_type, features, dataset_processor):
     """
     Model inference during validation or final evaluation.
     """
@@ -236,19 +245,28 @@ def inference(args, qa_net, features, dataset_processor):
             p_mask = sample.masks.as_in_ctx(ctx)
             a_mask = sample.answer_masks.as_in_ctx(ctx)
             p_mask = 1 - p_mask  # In the network, we use 1 --> no_mask, 0 --> mask
-            start_top_logits, start_top_index, end_top_logits, end_top_index, answerable_logits, \
-                pos_cls_logits = qa_net.inference(tokens, segment_ids, valid_length, p_mask, a_mask,
-                                                    args.start_top_n, args.end_top_n)
-            for i, qas_id in enumerate(sample.qas_id):
-                result = RawResultExtended(qas_id=qas_id,
-                                           start_top_logits=start_top_logits[i].asnumpy(),
-                                           start_top_index=start_top_index[i].asnumpy(),
-                                           end_top_logits=end_top_logits[i].asnumpy(),
-                                           end_top_index=end_top_index[i].asnumpy(),
-                                           answerable_logits=answerable_logits[i].asnumpy(),
-                                           pos_cls_logits=pos_cls_logits[i].asnumpy())
 
-                all_results.append(result)
+            if qa_model_type == 'conditional':
+                start_top_logits, start_top_index, end_top_logits, end_top_index, answerable_logits, \
+                    pos_cls_logits = qa_net.inference(tokens, segment_ids, valid_length, p_mask,
+                                                    args.start_top_n, args.end_top_n)
+                for i, qas_id in enumerate(sample.qas_id):
+                    result = RawResultExtended(qas_id=qas_id,
+                                               start_top_logits=start_top_logits[i].asnumpy(),
+                                               start_top_index=start_top_index[i].asnumpy(),
+                                               end_top_logits=end_top_logits[i].asnumpy(),
+                                               end_top_index=end_top_index[i].asnumpy(),
+                                               answerable_logits=answerable_logits[i].asnumpy(),
+                                               pos_cls_logits=pos_cls_logits[i].asnumpy())
+
+                    all_results.append(result)
+            elif qa_model_type == 'answerable':
+                answerable_logits = qa_net(tokens, segment_ids, valid_length, p_mask, a_mask)
+                for i, qas_id in enumerate(sample.qas_id):
+                    result = RawAnswerableProb(qas_id=qas_id,
+                                               answerable_logits=answerable_logits[i].asnumpy())
+
+                    all_results.append(result)
 
         # logging
         if (batch_idx + 1)  % log_interval == 0:
@@ -266,7 +284,6 @@ def inference(args, qa_net, features, dataset_processor):
     logging.info('Time cost=%2f s, Thoughput=%.2f samples/s', epoch_toc - epoch_tic,
                  total_num / (epoch_toc - epoch_tic))
 
-
     infer_features = collections.OrderedDict()
     for index, (left_index, right_index) in enumerate(zip(chunk_feature_ptr[:-1],
                                                           chunk_feature_ptr[1:])):
@@ -279,15 +296,23 @@ def inference(args, qa_net, features, dataset_processor):
         example_qas_id = list(qas_ids)[0]
         assert example_qas_id == original_feature.qas_id, \
             'Mismatch Occured between original feature and chunked features'
-        start_ends = predict_extended(
-            feature=original_feature,
-            chunked_features=chunked_features,
-            results=results,
-            n_best_size=args.n_best_size,
-            max_answer_length=args.max_answer_length,
-            start_top_n=args.start_top_n,
-            end_top_n=args.end_top_n)
-        infer_features[example_qas_id] = start_ends
+
+        if qa_model_type == 'conditional':
+            start_ends = predict_extended(
+                feature=original_feature,
+                chunked_features=chunked_features,
+                results=results,
+                n_best_size=args.n_best_size,
+                max_answer_length=args.max_answer_length,
+                start_top_n=args.start_top_n,
+                end_top_n=args.end_top_n)
+            infer_features[example_qas_id] = start_ends
+        elif qa_model_type == 'answerable':
+            not_answerable_score = answerable_extended(
+                original_feature=original_feature,
+                chunked_features=chunked_features,
+                results=results)
+            infer_features[example_qas_id] = not_answerable_score
 
     return infer_features
 
@@ -355,26 +380,31 @@ def ensemble(args, is_save=True):
 
     dev_data_path = os.path.join(args.data_dir, 'dev-v{}.json'.format(args.version))
 
-    def inference_single_ckpt(param_checkpoint, all_start_ends, features):
+    def inference_single_ckpt(param_checkpoint, predicted_results, features):
         logging.info('Inference the fine-tuned parameters {}'.format(param_checkpoint))
+        if 'conditional' in param_checkpoint:
+            qa_model_type = 'conditional'
+        elif 'answerable' in param_checkpoint:
+            qa_model_type = 'answerable'
+
         cfg, tokenizer, qa_net, use_segmentation = get_network(
             args.model_name, ctx_l,
             args.classifier_dropout,
             checkpoint_path=param_checkpoint,
-            qa_model_type='conditional')
-        cur_features = inference(args, qa_net, features, dataset_processor)
+            qa_model_type=qa_model_type)
+        cur_features = inference(args, qa_net, qa_model_type, features, dataset_processor)
 
-        # update all_start_ends
+        # update predicted_results
         for qas_id, start_ends in cur_features.items():
-            if qas_id not in all_start_ends:
-                all_start_ends[qas_id] = start_ends
+            if qas_id not in predicted_results:
+                predicted_results[qas_id] = start_ends
             else:
-                all_start_ends[qas_id].extend(start_ends)
+                predicted_results[qas_id].extend(start_ends)
 
-    def scatter_and_update(all_start_ends, factor=1.0):
+    def scatter_and_update(predicted_results, factor=1.0):
         all_predictions = {}
         all_scores = {}
-        for qas_id, start_end_list in all_start_ends.items():
+        for qas_id, start_end_list in predicted_results.items():
             has_ans_dict = collections.OrderedDict()
             no_score, cls_score = 10000000, 10000000
             for instance in start_end_list:
@@ -405,6 +435,10 @@ def ensemble(args, is_save=True):
 
         return all_predictions, all_scores
 
+    def merge(all_scores, na_probs):
+        for k,v in na_probs.items():
+            all_scores[k].append(v)
+
     filenames = [
         os.path.join(args.ckpt_dir, f) for f in os.listdir(args.ckpt_dir) if '.params' in f]
     filenames.sort(key=lambda ele: (len(ele), ele), reverse=True)
@@ -414,36 +448,50 @@ def ensemble(args, is_save=True):
         train_start_ends = {}
         inference_single_ckpt(filenames[0], train_start_ends, train_features)
         _, train_scores = scatter_and_update(train_start_ends)
-        ml_voter_path = os.path.join(args.output_dir, 'voter.params')
-        ml_voter(train_scores, ml_voter_path, data_file=train_data_path, is_training=True)
+
         training_scores_file = os.path.join(args.output_dir, 'training_scores.json')
         with open(training_scores_file, 'w') as of:
             of.write(json.dumps(train_scores, indent=4) + '\n')
+
+        train_probs = {}
+        inference_single_ckpt(filenames[2], train_probs, train_features)
+        train_probs_file = os.path.join(args.output_dir, 'train_probs.json')
+        with open(train_probs_file, 'w') as of:
+            of.write(json.dumps(train_probs, indent=4) + '\n')
+
+        merge(train_scores, train_probs)
+
+        ml_voter_path = os.path.join(args.output_dir, 'mlp.voter')
+        ml_voter(train_scores, ml_voter_path, data_file=train_data_path, is_training=True)
+
     else:
         ml_voter_path = args.voter_path
 
     dev_start_ends = {}
-    for idx, param_checkpoint in enumerate(filenames):
-        inference_single_ckpt(param_checkpoint, dev_start_ends, dev_features)
+    dev_probs = {}
+    inference_single_ckpt(filenames[2], dev_probs, dev_features)
 
-        # Update the results step step
-        all_predictions, all_scores = scatter_and_update(dev_start_ends, idx + 1)
+    for idx, param_checkpoint in enumerate(filenames[:-1]):
+        inference_single_ckpt(param_checkpoint, dev_start_ends, dev_features)
+        all_predictions, dev_scores = scatter_and_update(dev_start_ends, idx + 1)
         dev_scores_file = os.path.join(args.output_dir, 'dev_scores-{}.json'.format(idx))
         with open(dev_scores_file, 'w') as of:
-            of.write(json.dumps(all_scores, indent=4) + '\n')
-        no_answer_score_json = ml_voter(all_scores, ml_voter_path, is_training=False)
-        # make the predictions
-        for feature in dev_features:
-            context_text = feature.context_text
-            context_token_offsets = feature.context_token_offsets
-            qas_id = feature.qas_id
-            start_idx, end_idx = all_predictions[qas_id]
-            pred_answer = context_text[context_token_offsets[start_idx][0]:
-                                       context_token_offsets[end_idx][1]]
-            all_predictions[qas_id] = pred_answer
+            of.write(json.dumps(dev_scores, indent=4) + '\n')
 
-        na_prob = no_answer_score_json if args.version == '2.0' else None
-        eval_dict, revised_result = squad_eval(dev_data_path, all_predictions, na_prob, revise=True)
+    merge(dev_scores, dev_probs)
+    no_answer_score_json = ml_voter(dev_scores, ml_voter_path, is_training=False)
+    # make the predictions
+    for feature in dev_features:
+        context_text = feature.context_text
+        context_token_offsets = feature.context_token_offsets
+        qas_id = feature.qas_id
+        start_idx, end_idx = all_predictions[qas_id]
+        pred_answer = context_text[context_token_offsets[start_idx][0]:
+                                   context_token_offsets[end_idx][1]]
+        all_predictions[qas_id] = pred_answer
+
+    na_prob = no_answer_score_json if args.version == '2.0' else None
+    eval_dict, revised_result = squad_eval(dev_data_path, all_predictions, na_prob, revise=True)
 
     if is_save:
         logging.info('The evaluated files are saved in {}'.format(args.output_dir))
@@ -467,6 +515,7 @@ def ensemble(args, is_save=True):
 if __name__ == '__main__':
     os.environ['MXNET_GPU_MEM_POOL_TYPE'] = 'Round'
     os.environ['MXNET_USE_FUSION'] = '0'  # Manually disable pointwise fusion
+    os.environ["TOKENIZERS_PARALLELISM"] = str(True)
     args = parse_args()
     logging_config(args.output_dir, name='ensemble_squad{}'.format(args.version))
     set_seed(args.seed)

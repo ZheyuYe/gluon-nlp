@@ -377,23 +377,16 @@ def train(args):
     return params_saved
 
 
-RawResultExtended = collections.namedtuple(
-    'RawResultExtended',
+RawAnswerableProb = collections.namedtuple(
+    'RawAnswerableProb',
     ['qas_id',
      'answerable_logits'])
 
 
-def predict_extended(original_feature,
-                     chunked_features,
-                     results,
-                     n_best_size,
-                     max_answer_length=64,
-                     start_top_n=5,
-                     end_top_n=5):
-    """Get prediction results for SQuAD.
-
-    Start Logits: (B, N_start)
-    End Logits: (B, N_start, N_end)
+def answerable_extended(original_feature,
+                        chunked_features,
+                        results):
+    """Get prediction answerable probability for SQuAD.
 
     Parameters
     ----------
@@ -403,22 +396,10 @@ def predict_extended(original_feature,
         List of ChunkFeatures
     results
         List of model predictions for span start and span end.
-    n_best_size
-        Best N results written to file
-    max_answer_length
-        Maximum length of the answer tokens.
-    start_top_n
-        Number of start-position candidates
-    end_top_n
-        Number of end-position candidates
     Returns
     -------
     not_answerable_score
         Model's estimate that the question is not answerable.
-    prediction
-        The final prediction.
-    nbest_json
-        n-best predictions with their probabilities.
     """
     not_answerable_score = 1000000  # Score for not-answerable. We set it to be a large and positive
     # If one chunk votes for answerable, we will treat the context as answerable,
@@ -506,7 +487,7 @@ def evaluate(args, last=True):
                 p_mask = 1 - p_mask  # In the network, we use 1 --> no_mask, 0 --> mask
                 answerable_logits = qa_net(tokens, segment_ids, valid_length, p_mask, a_mask)
                 for i, qas_id in enumerate(sample.qas_id):
-                    result = RawResultExtended(qas_id=qas_id,
+                    result = RawAnswerableProb(qas_id=qas_id,
                                                answerable_logits=answerable_logits[i].asnumpy())
 
                     all_results.append(result)
@@ -539,14 +520,10 @@ def evaluate(args, last=True):
             example_qas_id = list(qas_ids)[0]
             assert example_qas_id == original_feature.qas_id, \
                 'Mismatch Occured between original feature and chunked features'
-            not_answerable_score = predict_extended(
+            not_answerable_score = answerable_extended(
                 original_feature=original_feature,
                 chunked_features=chunked_features,
-                results=results,
-                n_best_size=args.n_best_size,
-                max_answer_length=args.max_answer_length,
-                start_top_n=args.start_top_n,
-                end_top_n=args.end_top_n)
+                results=results)
             no_answer_score_json[example_qas_id] = not_answerable_score
 
         cur_eval = answerable_eval(dev_data_path, no_answer_score_json)
@@ -594,6 +571,7 @@ def evaluate(args, last=True):
 if __name__ == '__main__':
     os.environ['MXNET_GPU_MEM_POOL_TYPE'] = 'Round'
     os.environ['MXNET_USE_FUSION'] = '0'  # Manually disable pointwise fusion
+    os.environ["TOKENIZERS_PARALLELISM"] = str(True)
     args = parse_args()
     logging_config(args.output_dir, name='finetune_squad{}'.format(args.version))
     set_seed(args.seed)

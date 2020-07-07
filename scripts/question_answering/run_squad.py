@@ -669,6 +669,7 @@ RawResultExtended = collections.namedtuple(
      'start_top_index',
      'end_top_logits',
      'end_top_index',
+     'pos_cls_logits'
      'answerable_logits'])
 
 
