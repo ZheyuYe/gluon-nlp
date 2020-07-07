@@ -164,6 +164,7 @@ class SquadDatasetProcessor:
                                                     'valid_length',
                                                     'segment_ids',
                                                     'masks',
+                                                    'answer_masks',
                                                     'is_impossible',
                                                     'gt_start',
                                                     'gt_end',
@@ -176,6 +177,7 @@ class SquadDatasetProcessor:
                                                'valid_length': bf.Stack(),
                                                'segment_ids': bf.Pad(),
                                                'masks': bf.Pad(val=1),
+                                               'answer_masks': bf.Pad(val=0),
                                                'is_impossible': bf.Stack(),
                                                'gt_start': bf.Stack(),
                                                'gt_end': bf.Stack(),
@@ -232,28 +234,44 @@ class SquadDatasetProcessor:
             doc_stride=self._doc_stride,
             max_chunk_length=self._max_seq_length - len(truncated_query_ids) - 3)
         for chunk in chunks:
-            data = np.array([self.cls_id] + truncated_query_ids + [self.sep_id] +
+            data = np.array([self._tokenizer.vocab.cls_id] + truncated_query_ids +
+                            [self._tokenizer.vocab.sep_id] +
                             feature.context_token_ids[chunk.start:(chunk.start + chunk.length)] +
-                            [self.sep_id], dtype=np.int32)
+                            [self._tokenizer.vocab.sep_id], dtype=np.int32)
             valid_length = len(data)
             segment_ids = np.array([0] + [0] * len(truncated_query_ids) +
                                    [0] + [1] * chunk.length + [1], dtype=np.int32)
-            masks = np.array([0] + [1] * len(truncated_query_ids) + [1] + [0] * chunk.length + [1],
+            chunk_masks = [0] * chunk.length
+            masks = np.array([0] + [1] * len(truncated_query_ids) + [1] + chunk_masks + [1],
                              dtype=np.int32)
             context_offset = len(truncated_query_ids) + 2
-            if chunk.start_pos is None and chunk.end_pos is None:
-                start_pos = 0
-                end_pos = 0
-            else:
+            plau_chunk_masks = chunk_masks.copy()
+
+            if chunk.start_pos is not None and chunk.end_pos is not None:
                 # Here, we increase the start and end because we put query before context
                 start_pos = chunk.start_pos + context_offset
                 end_pos = chunk.end_pos + context_offset
+                # for answer_masks 1-> not mask, 0 -> mask
+                plau_chunk_masks[chunk.start_pos:chunk.end_pos + 1] = [1] * (end_pos - start_pos + 1)
+                answer_masks = np.array([1] + [1] * len(truncated_query_ids) + [0] + plau_chunk_masks + [0],
+                                 dtype=np.int32)
+            else:
+                start_pos = 0
+                end_pos = 0
+                answer_masks = np.array([1] + [1] * len(truncated_query_ids) + [0] + chunk_masks + [0],
+                                 dtype=np.int32)
+            is_impossible = feature.is_impossible or chunk.is_impossible
+            if is_impossible:
+                start_pos = 0
+                end_pos = 0
+
             chunk_feature = self.ChunkFeature(qas_id=feature.qas_id,
                                               data=data,
                                               valid_length=valid_length,
                                               segment_ids=segment_ids,
                                               masks=masks,
-                                              is_impossible=chunk.is_impossible,
+                                              answer_masks=answer_masks,
+                                              is_impossible=is_impossible,
                                               gt_start=start_pos,
                                               gt_end=end_pos,
                                               context_offset=context_offset,
