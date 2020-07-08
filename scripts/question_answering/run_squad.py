@@ -776,6 +776,8 @@ def predict_extended(original_feature,
         seen_predictions.add(pred_answer)
         nbest.append((pred_answer, pred_score))
 
+    #TODO(zheyuye), multiple indexs wtih same predictions
+
     # In very rare edge cases we could have no valid predictions. So we
     # just create a nonce prediction in this case to avoid failure.
     if len(nbest) == 0:

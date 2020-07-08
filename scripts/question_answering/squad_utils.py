@@ -454,6 +454,7 @@ class MLP(HybridBlock):
         self.output = nn.Dense(1, use_bias=False)
 
     def hybrid_forward(self, F, x):
+        out = x
         out = self.hidden(out)
         out = self.output(out)
         return out
@@ -465,7 +466,7 @@ def ml_voter(
         data_file=None,
         is_training=False,
         val_ratio=0.2,
-        num_epochs=5,
+        num_epochs=10,
         batch_size=4096):
 
     X = mx.np.array(list(all_scores.values()), dtype=np.float32)

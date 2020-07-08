@@ -408,8 +408,9 @@ def ensemble(args, is_save=True):
         all_predictions = {}
         all_scores = {}
         for qas_id, start_end_list in predicted_results.items():
-            has_ans_dict = collections.OrderedDict()
-            no_score, cls_score = 10000000, 10000000
+            has_ans_dict = {}
+            start_idx, end_idx = None, None
+            highest_has_score, no_score, cls_score = - 10000000, 10000000, 10000000
             for instance in start_end_list:
                 start = instance.start_idx
                 end = instance.end_idx
@@ -428,11 +429,8 @@ def ensemble(args, is_save=True):
 
             # Get the the start and end positions with highest has_score
             if len(has_ans_dict):
-                (start_idx, end_idx), highest_has_score = has_ans_dict.popitem(0)
-            else:
-                # There is no valid after inference
-                start_idx, end_idx = -1, -1
-                highest_has_score, no_score, cls_score = - 10000000, 10000000, 10000000
+                has_ans_dict = sorted(has_ans_dict.items(), key=lambda obj: obj[1])
+                (start_idx, end_idx), highest_has_score = has_ans_dict[-1]
             all_predictions[qas_id] = (start_idx, end_idx)
             all_scores[qas_id] = [highest_has_score, no_score, cls_score]
 
@@ -458,7 +456,7 @@ def ensemble(args, is_save=True):
             of.write(json.dumps(train_scores, indent=4) + '\n')
 
         train_probs = {}
-        inference_single_ckpt(filenames[2], train_probs, train_features)
+        inference_single_ckpt(filenames[-1], train_probs, train_features)
         train_probs_file = os.path.join(args.output_dir, 'train_probs.json')
         with open(train_probs_file, 'w') as of:
             of.write(json.dumps(train_probs, indent=4) + '\n')
@@ -474,6 +472,9 @@ def ensemble(args, is_save=True):
     dev_start_ends = {}
     dev_probs = {}
     inference_single_ckpt(filenames[2], dev_probs, dev_features)
+    dev_probs_file = os.path.join(args.output_dir, 'dev_probs.json')
+    with open(dev_probs_file, 'w') as of:
+        of.write(json.dumps(dev_probs, indent=4) + '\n')
 
     for idx, param_checkpoint in enumerate(filenames[:-1]):
         inference_single_ckpt(param_checkpoint, dev_start_ends, dev_features)
@@ -490,7 +491,7 @@ def ensemble(args, is_save=True):
         context_token_offsets = feature.context_token_offsets
         qas_id = feature.qas_id
         start_idx, end_idx = all_predictions[qas_id]
-        if start_idx >=0 and end_idx >=0:
+        if start_idx is not None and end_idx is not None:
             pred_answer = context_text[context_token_offsets[start_idx][0]:
                                        context_token_offsets[end_idx][1]]
         else:
