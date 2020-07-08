@@ -87,6 +87,7 @@ def parse_args():
     args = parser.parse_args()
     return args
 
+
 SinglePredict = collections.namedtuple(
     'SinglePredict',
     ['start_idx',
@@ -104,6 +105,7 @@ RawResultExtended = collections.namedtuple(
      'end_top_index',
      'pos_cls_logits',
      'answerable_logits'])
+
 
 def predict_extended(feature,
                      chunked_features,
@@ -249,7 +251,7 @@ def inference(args, qa_net, qa_model_type, features, dataset_processor):
             if qa_model_type == 'conditional':
                 start_top_logits, start_top_index, end_top_logits, end_top_index, answerable_logits, \
                     pos_cls_logits = qa_net.inference(tokens, segment_ids, valid_length, p_mask,
-                                                    args.start_top_n, args.end_top_n)
+                                                      args.start_top_n, args.end_top_n)
                 for i, qas_id in enumerate(sample.qas_id):
                     result = RawResultExtended(qas_id=qas_id,
                                                start_top_logits=start_top_logits[i].asnumpy(),
@@ -269,7 +271,7 @@ def inference(args, qa_net, qa_model_type, features, dataset_processor):
                     all_results.append(result)
 
         # logging
-        if (batch_idx + 1)  % log_interval == 0:
+        if (batch_idx + 1) % log_interval == 0:
             # Output the loss of per step
             toc = time.time()
             logging.info(
@@ -335,7 +337,8 @@ def ensemble(args, is_save=True):
         else:
             # Load the data
             logging.info('Load data from {}, Version={}'.format(args.data_dir, args.version))
-            train_examples = get_squad_examples(args.data_dir, segment='train', version=args.version)
+            train_examples = get_squad_examples(
+                args.data_dir, segment='train', version=args.version)
             start = time.time()
             num_process = min(cpu_count(), 8)
             logging.info('Tokenize Training Data:')
@@ -428,7 +431,7 @@ def ensemble(args, is_save=True):
                 (start_idx, end_idx), highest_has_score = has_ans_dict.popitem(0)
             else:
                 # There is no valid after inference
-                start_idx, end_idx = 0, 0
+                start_idx, end_idx = -1, -1
                 highest_has_score, no_score, cls_score = - 10000000, 10000000, 10000000
             all_predictions[qas_id] = (start_idx, end_idx)
             all_scores[qas_id] = [highest_has_score, no_score, cls_score]
@@ -436,7 +439,7 @@ def ensemble(args, is_save=True):
         return all_predictions, all_scores
 
     def merge(all_scores, na_probs):
-        for k,v in na_probs.items():
+        for k, v in na_probs.items():
             all_scores[k].append(v)
 
     filenames = [
@@ -445,6 +448,7 @@ def ensemble(args, is_save=True):
     # TODO(zheyuye), weight scheming with different values of each ckpt
     # train a machine learning based voter
     if not args.voter_path:
+
         train_start_ends = {}
         inference_single_ckpt(filenames[0], train_start_ends, train_features)
         _, train_scores = scatter_and_update(train_start_ends)
@@ -486,8 +490,11 @@ def ensemble(args, is_save=True):
         context_token_offsets = feature.context_token_offsets
         qas_id = feature.qas_id
         start_idx, end_idx = all_predictions[qas_id]
-        pred_answer = context_text[context_token_offsets[start_idx][0]:
-                                   context_token_offsets[end_idx][1]]
+        if start_idx >=0 and end_idx >=0:
+            pred_answer = context_text[context_token_offsets[start_idx][0]:
+                                       context_token_offsets[end_idx][1]]
+        else:
+            pred_answer = ''
         all_predictions[qas_id] = pred_answer
 
     na_prob = no_answer_score_json if args.version == '2.0' else None

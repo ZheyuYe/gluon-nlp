@@ -3,7 +3,6 @@ import os
 import re
 import json
 import time
-import string
 import logging
 import warnings
 import collections
@@ -23,6 +22,7 @@ from gluonnlp.utils.preprocessing import match_tokens_with_char_spans
 int_float_regex = re.compile('^\d+\.{0,1}\d*$')  # matches if a number is either integer or float
 
 mx.npx.set_np()
+
 
 def get_official_squad_eval_script(version='2.0', download_dir=None):
     url_info = {'2.0': ['evaluate-v2.0.py',
@@ -450,10 +450,13 @@ def convert_squad_example_to_feature(example: SquadExample,
 class MLP(HybridBlock):
     def __init__(self, **kwargs):
         super(MLP, self).__init__(**kwargs)
+        self.hidden = nn.Dense(8, activation='tanh')
         self.output = nn.Dense(1, use_bias=False)
 
     def hybrid_forward(self, F, x):
-        return self.output(x)
+        out = self.hidden(out)
+        out = self.output(out)
+        return out
 
 
 def ml_voter(
@@ -507,7 +510,7 @@ def ml_voter(
             is_correct = mx.np.equal(labels, preds)
             acc = (is_correct * weights).sum() / (weights.sum() + 1e-6)
             return acc
-        logging.info('String training a simple MLP-based voter')
+        logging.info('Starting training a simple MLP-based voter')
         for epoch in range(num_epochs):
             train_loss, train_acc, valid_acc = 0., 0., 0.
             tic = time.time()
