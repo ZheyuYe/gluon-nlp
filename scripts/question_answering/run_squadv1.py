@@ -384,8 +384,8 @@ def predict_extended(original_feature,
                 all_end_idx.append(end_idx)
                 all_pred_score.append(pred_score)
 
-    all_start_idx.append(-1)
-    all_end_idx.append(-1)
+    all_start_idx.append(None)
+    all_end_idx.append(None)
     all_pred_score.append(score_null)
 
     sorted_start_end_score = sorted(zip(all_start_idx, all_end_idx, all_pred_score),
@@ -397,7 +397,7 @@ def predict_extended(original_feature,
     for start_idx, end_idx, pred_score in sorted_start_end_score:
         if len(seen_predictions) >= n_best_size:
             break
-        if start_idx >= 0 and end_idx >=0:
+        if start_idx is not None and end_idx is not None:
             pred_answer = context_text[context_token_offsets[start_idx][0]:
                                        context_token_offsets[end_idx][1]]
         else:
