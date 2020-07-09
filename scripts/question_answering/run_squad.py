@@ -21,9 +21,16 @@ from models import ModelForQABasic, ModelForQAConditionalV1, ModelForAnswerable
 from eval_utils import squad_eval
 from squad_utils import SquadFeature, get_squad_examples, convert_squad_example_to_feature
 from gluonnlp.models import get_backbone
-from gluonnlp.utils.misc import grouper, repeat, set_seed, parse_ctx, logging_config, count_parameters
+from gluonnlp.utils.misc import repeat, grouper, set_seed, init_comm, \
+    logging_config, count_parameters, parse_ctx
 from gluonnlp.initializer import TruncNorm
-from gluonnlp.utils.parameter import clip_grad_global_norm
+from gluonnlp.data.sampler import SplitSampler
+from gluonnlp.utils.parameter import grad_global_norm, clip_grad_global_norm
+
+try:
+    import horovod.mxnet as hvd
+except ImportError:
+    pass
 
 mx.npx.set_np()
 
@@ -48,6 +55,10 @@ def parse_args():
     parser.add_argument('--output_dir', type=str, default='squad_out',
                         help='The output directory where the model params will be written.'
                              ' default is squad_out')
+    # Communication
+    parser.add_argument('--comm_backend', type=str, default='device',
+                        choices=['horovod', 'dist_sync_device', 'device'],
+                        help='Communication backend.')
     parser.add_argument('--gpus', type=str, default='0',
                         help='list of gpus to run, e.g. 0 or 0,2,5. -1 means using cpu.')
     # Training hyperparameters
@@ -312,6 +323,50 @@ class SquadDatasetProcessor:
         return train_dataset, num_token_answer_mismatch, num_unreliable
 
 
+def get_squad_features(args, tokenizer, segment):
+    """
+    Get processed data features of SQuADExampls
+
+    Parameters
+    ----------
+    args : argparse.Namespace
+    tokenizer:
+        Tokenizer instance
+    segment: str
+        train or dev
+
+    Returns
+    -------
+    data_features
+        The list of processed data features
+    """
+    data_cache_path = os.path.join(CACHE_PATH,
+                                  'dev_{}_squad_{}.ndjson'.format(args.model_name,
+                                                                  args.version))
+    is_training = (segment == 'train')
+    if os.path.exists(data_cache_path) and not args.overwrite_cache:
+        data_features = []
+        with open(data_cache_path, 'r') as f:
+            for line in f:
+                data_features.append(SquadFeature.from_json(line))
+        logging.info('Found cached data features, load from {}'.format(data_cache_path))
+    else:
+        data_examples = get_squad_examples(args.data_dir, segment=segment, version=args.version)
+        start = time.time()
+        num_process = min(cpu_count(), 8)
+        logging.info('Tokenize Data:')
+        with Pool(num_process) as pool:
+            data_features = pool.map(functools.partial(convert_squad_example_to_feature,
+                                                      tokenizer=tokenizer,
+                                                      is_training=is_training), data_examples)
+        logging.info('Done! Time spent:{:.2f} seconds'.format(time.time() - start))
+        with open(data_cache_path, 'w') as f:
+            for feature in data_features:
+                f.write(feature.to_json() + '\n')
+
+    return data_features
+
+
 def get_network(model_name,
                 ctx_l,
                 dropout=0.1,
@@ -410,8 +465,8 @@ def untune_params(model, untunable_depth, not_included=[]):
         A list or parameter names that not included in the untunable parameters
     """
     all_layers = model.backbone.encoder.all_encoder_layers
-    for _, v in model.collect_params('.*embed*').items():
-        model.grad_req = 'null'
+    for _, value in model.collect_params('.*embed*').items():
+        value.grad_req = 'null'
 
     for layer in all_layers[:untunable_depth]:
         for key, value in layer.collect_params().items():
@@ -420,42 +475,18 @@ def untune_params(model, untunable_depth, not_included=[]):
                     continue
             value.grad_req = 'null'
 
+
 def train(args):
-    ctx_l = parse_ctx(args.gpus)
+    store, num_workers, rank, local_rank, is_master_node, ctx_l = init_comm(
+        args.comm_backend, args.gpus)
     cfg, tokenizer, qa_net, use_segmentation = \
         get_network(args.model_name, ctx_l,
                     args.classifier_dropout,
                     args.param_checkpoint,
                     args.backbone_path)
-    # Load the data
-    train_examples = get_squad_examples(args.data_dir, segment='train', version=args.version)
-    logging.info('Load data from {}, Version={}'.format(args.data_dir, args.version))
-    num_process = min(cpu_count(), 8)
-    train_cache_path = os.path.join(
-        CACHE_PATH, 'train_{}_squad_{}.ndjson'.format(
-            args.model_name, args.version))
-    if os.path.exists(train_cache_path) and not args.overwrite_cache:
-        train_features = []
-        with open(train_cache_path, 'r') as f:
-            for line in f:
-                train_features.append(SquadFeature.from_json(line))
-        logging.info('Found cached training features, load from {}'.format(train_cache_path))
 
-    else:
-        start = time.time()
-        logging.info('Tokenize Training Data:')
-        with Pool(num_process) as pool:
-            train_features = pool.map(
-                functools.partial(
-                    convert_squad_example_to_feature,
-                    tokenizer=tokenizer,
-                    is_training=True),
-                train_examples)
-        logging.info('Done! Time spent:{:.2f} seconds'.format(time.time() - start))
-        with open(train_cache_path, 'w') as f:
-            for feature in train_features:
-                f.write(feature.to_json() + '\n')
-
+    logging.info('Prepare training data')
+    train_features = get_squad_features(args, tokenizer, segment='train')
     dataset_processor = SquadDatasetProcessor(tokenizer=tokenizer,
                                               doc_stride=args.doc_stride,
                                               max_seq_length=args.max_seq_length,
@@ -475,12 +506,14 @@ def train(args):
                          sum([ele.is_impossible for ele in train_features])))
     logging.info('After Chunking, #Train Sample/Is Impossible = {}/{}'
                  .format(len(train_dataset), num_impossible))
+    sampler = SplitSampler(len(train_dataset), num_parts=num_workers,
+                                    part_index=rank, even_size=True)
     train_dataloader = mx.gluon.data.DataLoader(
         train_dataset,
         batchify_fn=dataset_processor.BatchifyFunction,
         batch_size=args.batch_size,
         num_workers=0,
-        shuffle=True)
+        sampler=sampler)
     # Froze parameters
     if 'electra' in args.model_name:
         # does not work for albert model since parameters in all layers are shared
@@ -489,17 +522,24 @@ def train(args):
         if args.layerwise_decay > 0:
             qa_net.backbone.apply_layerwise_decay(args.layerwise_decay)
 
+    logging.info('Creating distributed trainer...')
+    # Collect differentiable parameters
+    param_dict = qa_net.collect_params()
     # Do not apply weight decay to all the LayerNorm and bias
     for _, v in qa_net.collect_params('.*beta|.*gamma|.*bias').items():
         v.wd_mult = 0.0
-    # Collect differentiable parameters
-    params = [p for p in qa_net.collect_params().values() if p.grad_req != 'null']
+    params = [p for p in param_dict.values() if p.grad_req != 'null']
     # Set grad_req if gradient accumulation is required
     if args.num_accumulated > 1:
         logging.info('Using gradient accumulation. Effective global batch size = {}'
-                     .format(args.num_accumulated * args.batch_size * len(ctx_l)))
+                     .format(args.num_accumulated * args.batch_size * len(ctx_l) * num_workers))
         for p in params:
             p.grad_req = 'add'
+    # backend specific implementation
+    if args.comm_backend == 'horovod':
+        # Horovod: fetch and broadcast parameters
+        hvd.broadcast_parameters(param_dict, root_rank=0)
+
     epoch_size = (len(train_dataloader) + len(ctx_l) - 1) // len(ctx_l)
     if args.num_train_steps is not None:
         num_train_steps = args.num_train_steps
@@ -540,9 +580,12 @@ def train(args):
                                  'beta2': adam_betas[1],
                                  'epsilon': args.adam_epsilon,
                                  })
-    trainer = mx.gluon.Trainer(qa_net.collect_params(),
-                               args.optimizer, optimizer_params,
-                               update_on_kvstore=False)
+    if args.comm_backend == 'horovod':
+        trainer = hvd.DistributedTrainer(param_dict, args.optimizer, optimizer_params)
+    else:
+        trainer = mx.gluon.Trainer(param_dict, args.optimizer, optimizer_params,
+                                   update_on_kvstore=False)
+
     num_samples_per_update = 0
     loss_denom = float(len(ctx_l) * args.num_accumulated)
 
@@ -552,7 +595,7 @@ def train(args):
     log_sample_num = 0
     if args.num_accumulated != 1:
         # set grad to zero for gradient accumulation
-        qa_net.collect_params().zero_grad()
+        param_dict.zero_grad()
 
     # start training
     global_tic = time.time()
@@ -602,24 +645,27 @@ def train(args):
         # update
         trainer.allreduce_grads()
 
+        if args.max_grad_norm > 0:
+            # Here, the accumulated gradients are
+            # \sum_{n=1}^N g_n / loss_denom
+            # Thus, in order to clip the average gradient
+            #   \frac{1}{N} \sum_{n=1}^N      -->  clip to args.max_grad_norm
+            # We need to change the ratio to be
+            #  \sum_{n=1}^N g_n / loss_denom  -->  clip to args.max_grad_norm  * N / loss_denom
+            total_norm, ratio, is_finite = clip_grad_global_norm(
+                params, args.max_grad_norm * num_samples_per_update / loss_denom)
+        else:
+            total_norm = grad_global_norm(params)
 
-        # Here, the accumulated gradients are
-        # \sum_{n=1}^N g_n / loss_denom
-        # Thus, in order to clip the average gradient
-        #   \frac{1}{N} \sum_{n=1}^N      -->  clip to args.max_grad_norm
-        # We need to change the ratio to be
-        #  \sum_{n=1}^N g_n / loss_denom  -->  clip to args.max_grad_norm  * N / loss_denom
-        total_norm, ratio, is_finite = clip_grad_global_norm(
-            params, args.max_grad_norm * num_samples_per_update / loss_denom)
         total_norm = total_norm / (num_samples_per_update / loss_denom)
-
         trainer.update(num_samples_per_update / loss_denom)
         if args.num_accumulated != 1:
             # set grad to zero for gradient accumulation
-            qa_net.collect_params().zero_grad()
+            param_dict.zero_grad()
 
         # saving
-        if (step_num + 1) % save_interval == 0 or (step_num + 1) >= num_train_steps:
+        if local_rank == 0 and (step_num + 1) % save_interval == 0 or (
+                step_num + 1) >= num_train_steps:
             version_prefix = 'squad' + args.version
             ckpt_name = '{}_{}_{}.params'.format(args.model_name,
                                                  version_prefix,
@@ -636,7 +682,7 @@ def train(args):
             logging.info('Params saved in: {}'.format(params_saved))
 
         # logging
-        if (step_num + 1) % log_interval == 0:
+        if local_rank == 0 and (step_num + 1) % log_interval == 0:
             log_span_loss /= log_sample_num
             log_answerable_loss /= log_sample_num
             log_total_loss /= log_sample_num
@@ -645,8 +691,8 @@ def train(args):
                 'Step: {}/{}, Loss span/answer/total={:.4f}/{:.4f}/{:.4f},'
                 ' LR={:.8f}, grad_norm={:.4f}. Time cost={:.2f}, Throughput={:.2f} samples/s'
                 ' ETA={:.2f}h'.format((step_num + 1), num_train_steps, log_span_loss,
-                                      log_answerable_loss, log_total_loss, trainer.learning_rate, total_norm,
-                                      toc - tic, log_sample_num / (toc - tic),
+                                      log_answerable_loss, log_total_loss, trainer.learning_rate,
+                                      total_norm, toc - tic, log_sample_num / (toc - tic),
                                       (num_train_steps - (step_num + 1)) / ((step_num + 1) / (toc - global_tic)) / 3600))
             tic = time.time()
             log_span_loss = 0
@@ -656,7 +702,10 @@ def train(args):
             num_samples_per_update = 0
 
         if (step_num + 1) >= num_train_steps:
-            logging.info('Finish training step: %d', (step_num + 1))
+            toc = time.time()
+            logging.info(
+                'Finish training step: {} within {} hours'.format(
+                    step_num + 1, (toc - global_tic) / 3600))
             break
 
     return params_saved
@@ -797,31 +846,13 @@ def predict_extended(original_feature,
 
 def evaluate(args, last=True):
     ctx_l = parse_ctx(args.gpus)
+    logging.info('Srarting inference without horovod')
+
     cfg, tokenizer, qa_net, use_segmentation = get_network(
         args.model_name, ctx_l, args.classifier_dropout)
-    # Prepare dev set
-    dev_cache_path = os.path.join(CACHE_PATH,
-                                  'dev_{}_squad_{}.ndjson'.format(args.model_name,
-                                                                  args.version))
-    if os.path.exists(dev_cache_path) and not args.overwrite_cache:
-        dev_features = []
-        with open(dev_cache_path, 'r') as f:
-            for line in f:
-                dev_features.append(SquadFeature.from_json(line))
-        logging.info('Found cached dev features, load from {}'.format(dev_cache_path))
-    else:
-        dev_examples = get_squad_examples(args.data_dir, segment='dev', version=args.version)
-        start = time.time()
-        num_process = min(cpu_count(), 8)
-        logging.info('Tokenize Dev Data:')
-        with Pool(num_process) as pool:
-            dev_features = pool.map(functools.partial(convert_squad_example_to_feature,
-                                                      tokenizer=tokenizer,
-                                                      is_training=False), dev_examples)
-        logging.info('Done! Time spent:{:.2f} seconds'.format(time.time() - start))
-        with open(dev_cache_path, 'w') as f:
-            for feature in dev_features:
-                f.write(feature.to_json() + '\n')
+
+    logging.info('Prepare dev data')
+    dev_features = get_squad_features(args, tokenizer, segment='dev')
     dev_data_path = os.path.join(args.data_dir, 'dev-v{}.json'.format(args.version))
     dataset_processor = SquadDatasetProcessor(tokenizer=tokenizer,
                                               doc_stride=args.doc_stride,
@@ -838,8 +869,6 @@ def evaluate(args, last=True):
         """
         Model inference during validation or final evaluation.
         """
-        ctx_l = parse_ctx(args.gpus)
-        # We process all the chunk features and also
         dev_dataloader = mx.gluon.data.DataLoader(
             dev_all_chunk_features,
             batchify_fn=dataset_processor.BatchifyFunction,
