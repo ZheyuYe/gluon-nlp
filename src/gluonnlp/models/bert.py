@@ -604,7 +604,8 @@ def list_pretrained_bert():
 
 def get_pretrained_bert(model_name: str = 'google_en_cased_bert_base',
                         root: str = get_model_zoo_home_dir(),
-                        load_backbone=True, load_mlm=False)\
+                        load_backbone: str = True,
+                        load_mlm: str = False)\
         -> Tuple[CN, HuggingFaceWordPieceTokenizer, str, str]:
     """Get the pretrained bert weights
 
@@ -655,7 +656,6 @@ def get_pretrained_bert(model_name: str = 'google_en_cased_bert_base',
         local_mlm_params_path = None
     do_lower = True if 'lowercase' in PRETRAINED_URL[model_name]\
                        and PRETRAINED_URL[model_name]['lowercase'] else False
-    # TODO(sxjscience) Move do_lower to assets.
     tokenizer = HuggingFaceWordPieceTokenizer(
                     vocab_file=local_paths['vocab'],
                     unk_token='[UNK]',

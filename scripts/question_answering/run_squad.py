@@ -63,7 +63,10 @@ def parse_args():
                         help='list of gpus to run, e.g. 0 or 0,2,5. -1 means using cpu.')
     # Training hyperparameters
     parser.add_argument('--seed', type=int, default=100, help='Random seed')
-    parser.add_argument('--log_interval', type=int, default=100, help='The logging interval.')
+    parser.add_argument('--log_interval', type=int, default=50,
+                        help='The logging interval for training')
+    parser.add_argument('--eval_log_interval', type=int, default=10,
+                        help='The logging interval for evaluation')
     parser.add_argument('--save_interval', type=int, default=None,
                         help='the number of steps to save model parameters.'
                              'default is every epoch')
@@ -135,7 +138,7 @@ def parse_args():
     parser.add_argument('--all_evaluate', action='store_true',
                         help='Whether to evaluate all intermediate checkpoints '
                              'instead of only last one')
-    parser.add_argument('--max_saved_ckpt', type=int, default=10,
+    parser.add_argument('--max_saved_ckpt', type=int, default=5,
                         help='The maximum number of saved checkpoints')
     args = parser.parse_args()
     return args
@@ -341,8 +344,8 @@ def get_squad_features(args, tokenizer, segment):
         The list of processed data features
     """
     data_cache_path = os.path.join(CACHE_PATH,
-                                  'dev_{}_squad_{}.ndjson'.format(args.model_name,
-                                                                  args.version))
+                                  '{}_{}_squad_{}.ndjson'.format(
+                                  segment, args.model_name, args.version))
     is_training = (segment == 'train')
     if os.path.exists(data_cache_path) and not args.overwrite_cache:
         data_features = []
@@ -412,7 +415,6 @@ def get_network(model_name,
         backbone.load_parameters(
             backbone_params_path,
             ignore_extra=True,
-            allow_missing=True,
             ctx=ctx_l)
         num_params, num_fixed_params = count_parameters(backbone.collect_params())
         logging.info(
@@ -514,9 +516,8 @@ def train(args):
         batch_size=args.batch_size,
         num_workers=0,
         sampler=sampler)
-    # Froze parameters
     if 'electra' in args.model_name:
-        # does not work for albert model since parameters in all layers are shared
+        # Froze parameters, does not work for albert model since parameters in all layers are shared
         if args.untunable_depth > 0:
             untune_params(qa_net, args.untunable_depth)
         if args.layerwise_decay > 0:
@@ -675,7 +676,7 @@ def train(args):
             ckpt_candidates = [
                 f for f in os.listdir(
                     args.output_dir) if f.endswith('.params')]
-            # keep last 10 checkpoints
+            # keep last `max_saved_ckpt` checkpoints
             if len(ckpt_candidates) > args.max_saved_ckpt:
                 ckpt_candidates.sort(key=lambda ele: (len(ele), ele))
                 os.remove(os.path.join(args.output_dir, ckpt_candidates[0]))
@@ -845,8 +846,14 @@ def predict_extended(original_feature,
 
 
 def evaluate(args, last=True):
+    store, num_workers, rank, local_rank, is_master_node, ctx_l = init_comm(
+        args.comm_backend, args.gpus)
+    # only evaluate once
+    if rank != 0:
+        logging.info('Skipping node {}'.format(rank))
+        return
     ctx_l = parse_ctx(args.gpus)
-    logging.info('Srarting inference without horovod')
+    logging.info('Srarting inference without horovod on the first node on device {}'.format(str(ctx_l)))
 
     cfg, tokenizer, qa_net, use_segmentation = get_network(
         args.model_name, ctx_l, args.classifier_dropout)
@@ -876,7 +883,7 @@ def evaluate(args, last=True):
             num_workers=0,
             shuffle=False)
 
-        log_interval = args.log_interval
+        log_interval = args.eval_log_interval
         all_results = []
         epoch_tic = time.time()
         tic = time.time()
