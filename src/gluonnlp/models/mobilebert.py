@@ -687,21 +687,31 @@ class MobileBertModel(HybridBlock):
         word_embedding = self.word_embed(inputs)
 
         if self.trigram_embed:
+            # Projecting the embedding into units only for word embedding
+            conv_weight = F.npx.reshape(
+                self.embed_factorized_proj.weight.data(), (-2, -1, 3))
+            conv_bias = self.embed_factorized_proj.bias.data()
             if self._layout == 'NT':
-                word_embedding = F.np.concatenate(
-                    [F.np.pad(word_embedding[:, 1:], ((0, 0), (0, 1), (0, 0))),
-                     word_embedding,
-                     F.np.pad(word_embedding[:, :-1], ((0, 0), (1, 0), (0, 0)))], axis=-1)
+                # TODO(zheyuye), add more layout options for mx.npx.convolution
+                word_embedding = F.npx.convolution(
+                    data=F.np.swapaxes(word_embedding, 1, 2),
+                    weight=conv_weight,
+                    bias=conv_bias,
+                    kernel=(3,),
+                    pad=(1,),
+                    num_filter=self.units)
+                word_embedding = F.np.swapaxes(word_embedding, 1, 2)
             elif self._layout == 'TN':
-                word_embedding = F.np.concatenate(
-                    [F.np.pad(word_embedding[1:, :], ((0, 1), (0, 0), (0, 0))),
-                     word_embedding,
-                     F.np.pad(word_embedding[:-1, :], ((1, 0), (0, 0), (0, 0)))], axis=-1)
+                word_embedding = F.npx.convolution(
+                    data=F.np.transpose(a, (1, 2, 0)),
+                    weight=conv_weight,
+                    bias=conv_bias,
+                    kernel=(3,),
+                    pad=(1,),
+                    num_filter=self.units)
+                word_embedding = F.np.transpose(word_embedding, (2, 0, 1))
             else:
                 raise NotImplementedError
-        # Projecting the embedding into units only for word embedding
-        if self.trigram_embed or self.embed_size != self.units:
-            word_embedding = self.embed_factorized_proj(word_embedding)
 
         if token_types is None:
             token_types = F.np.zeros_like(inputs)
