@@ -51,7 +51,7 @@ def read_tsv_glue(tsv_file, num_skip=1, keep_column_names=False):
     if keep_column_names:
         assert num_skip == 1
     column_names = None
-    with open(tsv_file, 'r') as f:
+    with open(tsv_file, 'r', encoding="utf8") as f:
         for i, line in enumerate(f):
             line = line.strip()
             if i < num_skip:
@@ -614,8 +614,9 @@ def main(args):
     if args.data_dir is None:
         args.data_dir = args.benchmark
     args.cache_path = os.path.join(args.cache_path, args.benchmark)
-    print('Downloading {} to {}. Selected tasks = {}'.format(args.benchmark,
-                                                             args.data_dir, args.tasks))
+    print('Downloading {} to "{}". Selected tasks = {}'.format(args.benchmark,
+                                                               args.data_dir,
+                                                               args.tasks))
     os.makedirs(args.cache_path, exist_ok=True)
     os.makedirs(args.data_dir, exist_ok=True)
     tasks = get_tasks(args.benchmark, args.tasks)

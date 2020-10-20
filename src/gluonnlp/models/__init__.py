@@ -4,6 +4,7 @@ from typing import Tuple, List
 from . import albert
 from . import bert
 from . import electra
+from . import gpt2
 from . import mobilebert
 from . import roberta
 from . import transformer
@@ -13,6 +14,7 @@ from . import bart
 from ..base import get_model_zoo_home_dir
 from ..registry import BACKBONE_REGISTRY
 from ..data.tokenizers import BaseTokenizer
+from mxnet.gluon import Block
 
 
 def list_backbone_names():
@@ -52,7 +54,7 @@ def get_backbone(model_name: str,
     --------
 
     >>> from gluonnlp.models import get_backbone
-    >>> model_cls, tokenizer, cfg, backbone_param_path, _ = get_backbone('google_en_cased_bert_base')
+    >>> model_cls, cfg, tokenizer, backbone_param_path, _ = get_backbone('google_en_cased_bert_base')
     >>> model = model_cls.from_cfg(cfg)
     >>> model.load_parameters(backbone_param_path)
     """
